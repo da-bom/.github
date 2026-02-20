@@ -4,7 +4,7 @@
 
 **한 줄 요약**: 100만 가족 구성원의 공유 데이터를 실시간으로 집계하고, 부모/관리자가 설정한 정책(차단/한도/시간대 제한)을 **100ms 이내에 즉시 반영**하는 이벤트 기반 데이터 제어 시스템
 
-**팀 구성**: DABOM 팀 7인 (BE 5 + FE 2) — 김동혁, 나원빈, 박예진, 임지우, 백승우, 장예찬, 최승언
+**팀 구성**: DABOM 팀 7인 (BE 5 + FE 2) — 김동혁, 나원빈, 박예진, 백승우, 임지우, 장예찬, 최승언
 
 ---
 
@@ -1081,4 +1081,1215 @@ flowchart TD
 
 > **왜 이중 방어(Redis SETNX + RDS UNIQUE)?** Redis는 TTL 만료 후 키가 사라지므로, 장시간 후 재처리되는 이벤트는 Redis만으로 걸러낼 수 없다. RDS의 event_id UNIQUE 제약이 최종 안전망 역할을 한다.
 
-<!-- SECTION_BOUNDARY_12 -->
+---
+
+## 12. 데이터 모델
+
+### 12.1 저장소 역할 분리
+
+| 저장소 | 역할 | 특징 |
+|--------|------|------|
+| **Redis Cluster** | 실시간 캐시, 동시성 제어, 상태 관리 | 원자 연산(Lua Script), 저지연, 휘발성 |
+| **MySQL** | 영속 데이터, 원본(Source of Truth), 감사 로그 | ACID 보장, 장기 보관, 복잡한 쿼리 |
+| **Kafka** | 이벤트 백본, 비동기 메시징 | 순서 보장, 재처리 가능, 이력 보관 |
+| **S3** | 콜드 데이터 아카이브 | 저비용 장기 보관 |
+
+### 12.2 Redis 키 설계
+
+#### 가족 데이터
+
+| Key 패턴 | 타입 | 설명 | TTL |
+|----------|------|------|-----|
+| `family:{fid}:info` | Hash | 가족 기본 정보 (name, total_quota, created_at) | 영구 |
+| `family:{fid}:remaining` | String | 가족 공용 실시간 잔여량 (DECRBY 대상) | 월초 리셋 |
+
+```bash
+HSET family:100:info name "HappyFamily" total_quota "107374182400" created_at "1707462000"
+SET family:100:remaining "12884901888"
+```
+
+#### 사용자 사용량 (기간별 집계)
+
+| Key 패턴 | 타입 | 설명 | TTL |
+|----------|------|------|-----|
+| `family:{fid}:customer:{cid}:usage:{period}` | String | 기간별 누적 사용량 | 해당 기간 만료 시 |
+
+```bash
+SET family:100:customer:1:usage:monthly "5368709120"   # 월별 5GB
+SET family:100:customer:1:usage:daily "524288000"       # 일별 500MB
+```
+
+> **왜 사용량을 기간별(daily/monthly/weekly)로 분리 저장?** 정책이 "일일 한도", "월별 한도" 등 다양한 기간을 지원해야 하므로, Lua Script가 constraints의 `LIMIT:DATA:{PERIOD}`에서 기간을 추출하여 동적으로 해당 키를 참조한다. 새 기간(weekly) 추가 시 키만 추가하면 된다.
+
+#### 런타임 제약 (Runtime Constraints) — 핵심 설계
+
+| Key 패턴 | 타입 | 설명 |
+|----------|------|------|
+| `family:{fid}:customer:{cid}:constraints` | Hash | 사용자의 현재 유효 제약 조건 모음 |
+
+**Field 표준 (ACTION:TYPE 패턴)**:
+
+| Category | Field Name | Value | 설명 |
+|----------|-----------|-------|------|
+| 차단 | `BLOCK:ACCESS` | `'1'` | 전체 데이터 차단 |
+| | `BLOCK:APP:{APP_ID}` | `'1'` | 특정 앱 차단 |
+| | `BLOCK:TIME:START` | `"HHMM"` | 차단 시작 시간 |
+| | `BLOCK:TIME:END` | `"HHMM"` | 차단 종료 시간 |
+| 한도 | `LIMIT:DATA:{PERIOD}` | Bytes (Long) | 기간별 데이터 한도 |
+| 속도 | `THROTTLE:SPEED` | bps (Int) | 전송 속도 제한 |
+
+```bash
+# 일일 1GB 한도 + 유튜브 차단
+HMSET family:100:customer:1:constraints \
+  LIMIT:DATA:DAILY "1073741824" \
+  BLOCK:APP:com.google.youtube "1"
+
+# 야간 시간대 접속 차단 (22:00 ~ 07:00)
+HMSET family:100:customer:4:constraints \
+  BLOCK:TIME:START "2200" \
+  BLOCK:TIME:END "0700"
+```
+
+#### 시스템 안정성 및 중복 방지
+
+| Key 패턴 | 타입 | 설명 | TTL |
+|----------|------|------|-----|
+| `event:dedup:{uuid}` | String | Kafka 이벤트 중복 처리 방지 | 1시간 |
+| `family:{fid}:alert:{type}:{value}` | String | 알림 중복 발송 방지 | 월초 리셋 |
+
+#### 정책 메타데이터 (API용)
+
+| Key 패턴 | 타입 | 설명 |
+|----------|------|------|
+| `policy:def:{code}` | Hash | 관리자 정의 정책 템플릿 |
+| `family:{fid}:policy:{code}` | Hash | 가족에게 적용된 정책 설정값 |
+
+### 12.3 MySQL ERD
+
+```mermaid
+erDiagram
+    CUSTOMER ||--|{ FAMILY_MEMBER : "belongs to"
+    FAMILY ||--|{ FAMILY_MEMBER : "contains"
+    CUSTOMER ||--o{ CUSTOMER_QUOTA : "has monthly quota"
+    FAMILY ||--o{ CUSTOMER_QUOTA : "scoped to"
+    CUSTOMER ||--o{ USAGE_RECORD : "generates"
+    FAMILY ||--o{ USAGE_RECORD : "belongs to"
+    POLICY ||--o{ POLICY_ASSIGNMENT : "applied as"
+    FAMILY ||--o{ POLICY_ASSIGNMENT : "receives"
+    CUSTOMER ||--o{ POLICY_ASSIGNMENT : "targeted by"
+    CUSTOMER ||--o{ NOTIFICATION_LOG : "receives"
+    FAMILY ||--o{ NOTIFICATION_LOG : "scoped to"
+    FAMILY ||--o{ INVITE : "has"
+    CUSTOMER ||--o{ AUDIT_LOG : "performs"
+
+    CUSTOMER {
+        bigint id PK "AUTO_INCREMENT"
+        varchar phone_number UK "NOT NULL, 숫자만 11자리 (로그인 ID)"
+        varchar password_hash "NOT NULL, BCrypt"
+        varchar name "NOT NULL"
+        varchar email "NULL"
+        datetime created_at "DEFAULT CURRENT_TIMESTAMP"
+        datetime updated_at "DEFAULT CURRENT_TIMESTAMP"
+        datetime deleted_at "NULL, Soft Delete"
+    }
+
+    ADMIN {
+        bigint id PK "AUTO_INCREMENT"
+        varchar email UK "NOT NULL (로그인 ID)"
+        varchar password_hash "NOT NULL, BCrypt"
+        varchar name "NOT NULL"
+        datetime created_at "DEFAULT CURRENT_TIMESTAMP"
+        datetime deleted_at "NULL, Soft Delete"
+    }
+
+    FAMILY {
+        bigint id PK "AUTO_INCREMENT"
+        varchar name "NOT NULL, 가족 그룹명"
+        bigint created_by_id FK "NOT NULL, 최초 생성자 (이력 전용)"
+        bigint total_quota_bytes "NOT NULL, DEFAULT 100GB"
+        bigint used_bytes "NOT NULL DEFAULT 0"
+        date current_month "NOT NULL, 현재 과금 월"
+        datetime deleted_at "NULL, Soft Delete"
+    }
+
+    FAMILY_MEMBER {
+        bigint id PK "AUTO_INCREMENT"
+        bigint family_id FK "NOT NULL"
+        bigint customer_id FK "NOT NULL"
+        enum role "MEMBER or OWNER"
+        datetime joined_at "DEFAULT CURRENT_TIMESTAMP"
+        datetime deleted_at "NULL, Soft Delete"
+    }
+
+    CUSTOMER_QUOTA {
+        bigint id PK "AUTO_INCREMENT"
+        bigint customer_id FK "NOT NULL"
+        bigint family_id FK "NOT NULL"
+        bigint monthly_limit_bytes "NULL = 무제한"
+        bigint monthly_used_bytes "NOT NULL DEFAULT 0"
+        date current_month "NOT NULL"
+        boolean is_blocked "NOT NULL DEFAULT FALSE"
+        varchar block_reason "NULL"
+        datetime deleted_at "NULL, Soft Delete"
+    }
+
+    USAGE_RECORD {
+        bigint id PK "AUTO_INCREMENT"
+        varchar event_id UK "NOT NULL, Idempotency 키"
+        bigint customer_id FK "NOT NULL"
+        bigint family_id FK "NOT NULL"
+        bigint bytes_used "NOT NULL"
+        varchar app_id "NULL"
+        datetime event_time "NOT NULL"
+        datetime deleted_at "NULL, Soft Delete"
+    }
+
+    POLICY {
+        bigint id PK "AUTO_INCREMENT"
+        varchar name "NOT NULL"
+        varchar description "NULL"
+        enum require_role "DEFAULT MEMBER"
+        enum type "MONTHLY_LIMIT or TIME_BLOCK or APP_BLOCK or MANUAL_BLOCK"
+        json default_rules "NOT NULL"
+        boolean is_system "DEFAULT FALSE"
+        boolean is_activate "NOT NULL DEFAULT TRUE"
+        datetime deleted_at "NULL, Soft Delete"
+    }
+
+    POLICY_ASSIGNMENT {
+        bigint id PK "AUTO_INCREMENT"
+        bigint policy_id FK "NOT NULL"
+        bigint family_id FK "NOT NULL"
+        bigint target_customer_id FK "NULL = 가족 전체"
+        json rules "NOT NULL"
+        boolean is_active "NOT NULL DEFAULT TRUE"
+        datetime applied_at "DEFAULT CURRENT_TIMESTAMP"
+        bigint applied_by_id FK "NOT NULL"
+        datetime deleted_at "NULL, Soft Delete"
+    }
+
+    NOTIFICATION_LOG {
+        bigint id PK "AUTO_INCREMENT"
+        bigint customer_id FK "NOT NULL"
+        bigint family_id FK "NOT NULL"
+        enum type "THRESHOLD_ALERT or BLOCKED or UNBLOCKED or POLICY_CHANGED"
+        text message "NOT NULL"
+        json payload "NULL"
+        boolean is_read "NOT NULL DEFAULT FALSE"
+        datetime sent_at "DEFAULT CURRENT_TIMESTAMP"
+        datetime deleted_at "NULL, Soft Delete"
+    }
+
+    AUDIT_LOG {
+        bigint id PK "AUTO_INCREMENT"
+        bigint actor_id FK "NULL"
+        varchar action "NOT NULL"
+        varchar entity_type "NOT NULL"
+        bigint entity_id "NOT NULL"
+        json old_value "NULL"
+        json new_value "NULL"
+        varchar ip_address "NULL"
+        datetime created_at "DEFAULT CURRENT_TIMESTAMP"
+    }
+
+    INVITE {
+        bigint id PK "AUTO_INCREMENT"
+        bigint family_id FK "NOT NULL"
+        varchar phone_number "NOT NULL, 숫자만 11자리"
+        enum role "MEMBER or OWNER"
+        enum status "PENDING or ACCEPTED or EXPIRED or CANCELLED"
+        datetime expires_at "NOT NULL"
+        datetime deleted_at "NULL, Soft Delete"
+    }
+```
+
+> **왜 CUSTOMER와 ADMIN을 분리?** CUSTOMER(전화번호 로그인)와 ADMIN(이메일 로그인)은 인증 방식 자체가 다르다. 단일 USER 테이블에서 role로 구분하면 인증 로직에서 항상 role 체크가 필요하고 테이블이 비대해진다.
+
+> **왜 family.created_by_id는 이력 전용?** OWNER 권한 판단은 `family_member.role='OWNER'`로만 수행한다. `created_by_id`를 권한에 사용하면 "최초 생성자가 항상 OWNER"라는 제약이 생겨 유연성이 저하된다.
+
+### 12.4 핵심 테이블 DDL
+
+```sql
+CREATE TABLE customer (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    phone_number    VARCHAR(11) NOT NULL COMMENT '숫자만 11자리',
+    password_hash   VARCHAR(255) NOT NULL,
+    name            VARCHAR(100) NOT NULL,
+    email           VARCHAR(255),
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      DATETIME NULL,
+    UNIQUE (phone_number, deleted_at)
+);
+
+CREATE TABLE admin (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    email           VARCHAR(255) NOT NULL,
+    password_hash   VARCHAR(255) NOT NULL,
+    name            VARCHAR(100) NOT NULL,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      DATETIME NULL,
+    UNIQUE (email, deleted_at)
+);
+
+CREATE TABLE family (
+    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name                VARCHAR(100) NOT NULL,
+    created_by_id       BIGINT NOT NULL REFERENCES customer(id),
+    total_quota_bytes   BIGINT NOT NULL DEFAULT 107374182400,
+    used_bytes          BIGINT NOT NULL DEFAULT 0,
+    current_month       DATE NOT NULL,
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at          DATETIME NULL
+);
+
+CREATE TABLE family_member (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    family_id   BIGINT NOT NULL REFERENCES family(id),
+    customer_id BIGINT NOT NULL REFERENCES customer(id),
+    role        ENUM('MEMBER', 'OWNER') NOT NULL DEFAULT 'MEMBER',
+    joined_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at  DATETIME NULL,
+    UNIQUE (family_id, customer_id, deleted_at)
+);
+
+CREATE TABLE customer_quota (
+    id                      BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id             BIGINT NOT NULL REFERENCES customer(id),
+    family_id               BIGINT NOT NULL REFERENCES family(id),
+    monthly_limit_bytes     BIGINT,
+    monthly_used_bytes      BIGINT NOT NULL DEFAULT 0,
+    current_month           DATE NOT NULL,
+    is_blocked              BOOLEAN NOT NULL DEFAULT FALSE,
+    block_reason            VARCHAR(50),
+    updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at              DATETIME NULL,
+    UNIQUE (customer_id, family_id, current_month, deleted_at)
+);
+
+CREATE TABLE usage_record (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_id    VARCHAR(50) NOT NULL UNIQUE,
+    customer_id BIGINT NOT NULL REFERENCES customer(id),
+    family_id   BIGINT NOT NULL REFERENCES family(id),
+    bytes_used  BIGINT NOT NULL,
+    app_id      VARCHAR(100),
+    event_time  DATETIME NOT NULL,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at  DATETIME NULL
+);
+
+CREATE TABLE policy (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name            VARCHAR(100) NOT NULL,
+    description     VARCHAR(255),
+    require_role    ENUM('MEMBER', 'OWNER') NOT NULL DEFAULT 'MEMBER',
+    type            ENUM('MONTHLY_LIMIT', 'TIME_BLOCK', 'APP_BLOCK', 'MANUAL_BLOCK') NOT NULL,
+    default_rules   JSON NOT NULL,
+    is_system       BOOLEAN DEFAULT FALSE,
+    is_activate     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      DATETIME NULL
+);
+
+CREATE TABLE policy_assignment (
+    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
+    policy_id           BIGINT NOT NULL REFERENCES policy(id),
+    family_id           BIGINT NOT NULL REFERENCES family(id),
+    target_customer_id  BIGINT REFERENCES customer(id),
+    rules               JSON NOT NULL,
+    is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+    applied_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    applied_by_id       BIGINT NOT NULL REFERENCES customer(id),
+    deleted_at          DATETIME NULL
+);
+
+CREATE TABLE notification_log (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id BIGINT NOT NULL REFERENCES customer(id),
+    family_id   BIGINT NOT NULL REFERENCES family(id),
+    type        ENUM('THRESHOLD_ALERT', 'BLOCKED', 'UNBLOCKED', 'POLICY_CHANGED') NOT NULL,
+    message     TEXT NOT NULL,
+    payload     JSON,
+    is_read     BOOLEAN NOT NULL DEFAULT FALSE,
+    sent_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at  DATETIME NULL
+);
+
+CREATE TABLE audit_log (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    actor_id    BIGINT REFERENCES customer(id),
+    action      VARCHAR(50) NOT NULL,
+    entity_type VARCHAR(50) NOT NULL,
+    entity_id   BIGINT NOT NULL,
+    old_value   JSON,
+    new_value   JSON,
+    ip_address  VARCHAR(45),
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at  DATETIME NULL
+);
+
+CREATE TABLE invite (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    family_id       BIGINT NOT NULL REFERENCES family(id),
+    phone_number    VARCHAR(11) NOT NULL,
+    role            ENUM('MEMBER', 'OWNER') NOT NULL DEFAULT 'MEMBER',
+    status          ENUM('PENDING', 'ACCEPTED', 'EXPIRED', 'CANCELLED') NOT NULL DEFAULT 'PENDING',
+    expires_at      DATETIME NOT NULL,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      DATETIME NULL
+);
+```
+
+### 12.5 데이터 동기화 전략
+
+#### Write-Behind (자기소비 패턴)
+
+```mermaid
+flowchart LR
+    subgraph "실시간 경로"
+        A[processor-usage] --> B[Redis Lua Script]
+        B --> C[응답 반환 100ms 이내]
+    end
+
+    subgraph "비동기 경로 (자기소비)"
+        A --> D[Kafka usage-persist]
+        D --> E[processor-usage 자기소비]
+        E --> F[MySQL Bulk Insert]
+    end
+```
+
+1. processor-usage가 Redis Lua Script 실행 (실시간)
+2. 처리 결과를 Kafka `usage-persist` 토픽으로 발행
+3. 동일 processor-usage가 `usage-persist`를 소비하여 배치 수집 (5초/100건)
+4. MySQL에 Bulk Insert
+
+#### Batch 정산 (Reconciliation)
+
+매일 새벽 3시 Redis-RDS 불일치 보정:
+
+```sql
+SELECT family_id, SUM(bytes_used) as total_used
+FROM usage_record
+WHERE event_time >= DATE_FORMAT(CURRENT_DATE, '%Y-%m-01')
+  AND deleted_at IS NULL
+GROUP BY family_id;
+```
+
+#### DB Fallback
+
+```mermaid
+flowchart TD
+    A[요청 수신] --> B{Redis 상태?}
+    B -->|정상| C[Redis Lua Script 100ms 이내]
+    B -->|장애 Circuit Open| D[MySQL Fallback 성능 저하 감수]
+    C --> E[처리 완료]
+    D --> F[Row Lock으로 동시성 제어]
+    F --> E
+```
+
+```sql
+-- Row Lock 기반 Fallback
+SELECT * FROM customer_quota
+WHERE customer_id = ? AND family_id = ? AND current_month = ? AND deleted_at IS NULL
+FOR UPDATE;
+
+UPDATE customer_quota
+SET monthly_used_bytes = monthly_used_bytes + ?
+WHERE customer_id = ? AND family_id = ? AND current_month = ? AND deleted_at IS NULL
+  AND (monthly_limit_bytes IS NULL OR monthly_used_bytes + ? <= monthly_limit_bytes);
+```
+
+### 12.6 데이터 보관 정책 (Hot/Warm/Cold)
+
+| 계층 | 기간 | 저장소 | 용도 |
+|------|------|--------|------|
+| **Hot** | 7일 | Redis + RDS | 실시간 조회, 대시보드 |
+| **Warm** | 90일 | RDS | 리포트, 분석 |
+| **Cold** | 90일+ | S3 (Parquet) | 장기 보관, 감사 |
+
+### 12.7 인덱스 설계 + 파티셔닝
+
+**주요 인덱스**:
+
+| 테이블 | 인덱스 | 용도 |
+|--------|--------|------|
+| customer | (phone_number) | 로그인 조회 |
+| admin | (email) | 로그인 조회 |
+| family_member | (family_id), (customer_id) | 가족/사용자 목록 |
+| customer_quota | (customer_id, current_month) | 월별 한도 조회 |
+| usage_record | (family_id, event_time), (customer_id, event_time), (event_id) | 사용량 조회, Idempotency |
+| policy_assignment | (family_id), (target_customer_id) | 정책 조회 |
+| notification_log | (customer_id, sent_at DESC), (customer_id, type, sent_at DESC) | 알림 목록/타입별 필터 |
+| audit_log | (actor_id, created_at DESC), (entity_type, entity_id, created_at DESC) | 감사 이력 |
+
+**usage_record 월별 파티셔닝**:
+
+```sql
+CREATE TABLE usage_record (
+    ...
+) PARTITION BY RANGE (YEAR(event_time) * 100 + MONTH(event_time)) (
+    PARTITION p2025_01 VALUES LESS THAN (202502),
+    PARTITION p2025_02 VALUES LESS THAN (202503),
+    PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+```
+
+> **왜 usage_record를 월별 파티셔닝?** 일일 4억 건(5,000 TPS x 86,400초) 규모에서 단일 테이블은 쿼리 성능이 급락한다. 월별 파티셔닝으로 조회 범위를 제한하고, 90일+ 데이터는 파티션 단위로 S3에 아카이브한다.
+
+### 12.8 마이그레이션 전략 (Flyway)
+
+```
+db/migration/
+├── V1__create_user_table.sql
+├── V2__create_family_tables.sql
+├── V3__create_usage_tables.sql
+├── V4__create_policy_tables.sql
+├── V5__create_notification_tables.sql
+├── V6__add_primary_parent.sql
+├── V7__add_notification_type_index.sql
+├── V8__add_soft_delete_columns.sql
+├── V9__unify_role_system.sql
+├── V10__rename_owner_id_to_created_by_id.sql
+├── V11__split_user_to_customer_admin.sql      ← USER→CUSTOMER/ADMIN 분리
+├── V12__daily_to_monthly_quota.sql             ← daily→monthly 전환
+├── V13__move_policy_rules_to_assignment.sql    ← rules→assignment 이동
+├── V14__rename_family_group_to_family.sql      ← FAMILY_GROUP→FAMILY
+├── V15__add_policy_description_role_rules.sql  ← POLICY 필드 추가
+└── V16__add_policy_is_activate.sql             ← is_activate 추가
+```
+
+---
+
+## 13. API 명세
+
+### 13.1 API 개요
+
+| 항목 | 값 |
+|------|-----|
+| Base URL | `https://api.dabom.site` |
+| 인증 | JWT (Access 30분, Refresh 7일) |
+| 버전 관리 | `Accept-Version: 1.0` 헤더 |
+
+> **왜 Accept-Version 헤더 방식? (vs URL /v1/)** URL 버전은 경로가 변경되어 클라이언트 수정 범위가 크다. Accept-Version 헤더는 URL을 깔끔하게 유지하면서 서버에서 버전별 라우팅이 가능하다.
+
+> **왜 JWT 자체 구현? (vs OAuth 2.0 / 소셜 로그인)** 가족 데이터 제어 시스템에서 외부 인증 의존은 장애 전파 위험이 있다. 자체 JWT로 `familyId`, `role`을 토큰에 포함하면 매 요청마다 DB 조회 없이 권한 판단이 가능하다.
+
+**JWT Payload**:
+```json
+{ "customerId": 12345, "familyId": 100, "role": "OWNER", "exp": 1705312200 }
+```
+
+**공통 응답 형식**:
+```json
+// 성공
+{ "success": true, "data": { ... }, "timestamp": "2024-01-15T10:30:00Z" }
+// 에러
+{ "success": false, "error": { "code": "ERROR_CODE", "message": "...", "details": {} }, "timestamp": "..." }
+```
+
+**권한 모델**: member (모든 인증된 구성원) / owner (정책 수정, 복수 가능) / admin (시스템 전체 관리)
+
+### 13.2 CUSTOMERS 도메인 (6개)
+
+| 메서드 | 경로 | 권한 | 설명 |
+|--------|------|------|------|
+| POST | `/customers/login` | - | 전화번호 로그인 |
+| POST | `/customers/refresh` | member | 토큰 갱신 |
+| POST | `/customers/logout` | member | 로그아웃 |
+| POST | `/customers/signup` | - | 회원가입 |
+| GET | `/customers/usage` | member | 내 사용량 조회 |
+| GET | `/customers/policies` | member | 내 정책 조회 |
+
+### 13.3 FAMILIES 도메인 (9개)
+
+| 메서드 | 경로 | 권한 | 설명 |
+|--------|------|------|------|
+| GET | `/families/dashboard/usage?year=&month=` | member | 대시보드 사용량 |
+| GET | `/families/reports/usage?year=&month=` | member | 사용량 상세 리포트 |
+| GET | `/families/usage/current` | member | 실시간 가족 사용량 (SSE) |
+| GET | `/families/usage/customers` | member | 구성원별 실시간 사용량 |
+| POST | `/families/{familyId}/invite` | owner | 가족 초대 (전화번호) |
+| POST | `/families` | admin | 가족 그룹 검색 |
+| GET | `/families/{familyId}` | admin | 가족 상세 조회 |
+| GET | `/families/policies` | owner | 가족 구성원 정책 조회 |
+| PATCH | `/families/policies` | owner | 가족 구성원 정책 수정 |
+
+### 13.4 POLICIES 도메인 (5개)
+
+| 메서드 | 경로 | 권한 | 설명 |
+|--------|------|------|------|
+| GET | `/policies` | admin | 정책 목록 조회 |
+| POST | `/policies` | admin | 정책 생성 |
+| DELETE | `/policies/{policyId}` | admin | 정책 삭제 |
+| GET | `/policies/{policyId}` | admin | 정책 상세 조회 |
+| PATCH | `/policies/{policyId}` | admin | 정책 수정 |
+
+### 13.5 NOTIFICATIONS 도메인 (3개)
+
+| 메서드 | 경로 | 권한 | 설명 |
+|--------|------|------|------|
+| GET | `/notifications` | member | 누적 알림 조회 |
+| GET | `/notifications/alert` | member | 잔여량 경고 알림 (THRESHOLD_ALERT) |
+| GET | `/notifications/block` | member | 차단 알림 (BLOCKED, UNBLOCKED) |
+
+### 13.6 ADMIN 도메인 (5개)
+
+| 메서드 | 경로 | 권한 | 설명 |
+|--------|------|------|------|
+| POST | `/admin/login` | - | 관리자 로그인 (이메일) |
+| POST | `/admin/refresh` | admin | 관리자 토큰 갱신 |
+| POST | `/admin/logout` | admin | 관리자 로그아웃 |
+| GET | `/admin/audit-log` | admin | 감사 로그 조회 |
+| GET | `/admin/dashboard` | admin | 관리자 대시보드 |
+
+### 13.7 SSE 명세
+
+**연결**: `GET /families/{familyId}/stream` (Accept: text/event-stream)
+
+**Event Types**:
+
+| Event | Data 형식 |
+|-------|----------|
+| QUOTA_UPDATED | `{"remainingBytes":..., "usedPercent":...}` |
+| CUSTOMER_BLOCKED | `{"customerId":..., "blockReason":..., "blockedAt":...}` |
+| THRESHOLD_ALERT | `{"threshold":50, "remainingPercent":48.5, "message":...}` |
+| CUSTOMER_UNBLOCKED | `{"customerId":..., "reason":..., "unblockedAt":...}` |
+| policy-updated | `{"policyKey":..., "targetCustomerId":..., "oldValue":..., "newValue":...}` |
+
+- **Heartbeat**: 30초마다 `:heartbeat` 전송
+- **재연결**: Last-Event-ID 헤더 활용
+
+> **왜 SSE? (vs WebSocket)** 서버→클라이언트 단방향 푸시만 필요(사용량 갱신, 차단 알림)하다. WebSocket의 양방향은 불필요한 복잡도를 추가한다. SSE는 HTTP/2 위에서 자동 멀티플렉싱되고, 재연결(Last-Event-ID)이 프로토콜 수준에서 지원된다.
+
+### 13.8 에러 코드
+
+| 카테고리 | 코드 | HTTP | 설명 |
+|---------|------|------|------|
+| 인증 | AUTH_INVALID_CREDENTIALS | 401 | 잘못된 인증 정보 |
+| | AUTH_TOKEN_EXPIRED | 401 | 토큰 만료 |
+| | AUTH_TOKEN_INVALID | 401 | 유효하지 않은 토큰 |
+| | AUTH_INSUFFICIENT_PERMISSION | 403 | 권한 부족 |
+| 데이터 | DATA_FAMILY_NOT_FOUND | 404 | 가족 그룹 없음 |
+| | DATA_USER_NOT_FOUND | 404 | 사용자 없음 |
+| | DATA_MEMBER_LIMIT_EXCEEDED | 400 | 최대 구성원 수 초과 (10명) |
+| 정책 | POLICY_USER_BLOCKED | 403 | 사용자 차단됨 |
+| | POLICY_QUOTA_EXCEEDED | 403 | 할당량 초과 |
+| | POLICY_TIME_BLOCKED | 403 | 시간대 차단 중 |
+| | POLICY_ALREADY_BLOCKED | 409 | 이미 차단됨 |
+| | POLICY_TEMPLATE_NOT_FOUND | 404 | 정책 템플릿 없음 |
+| | POLICY_TEMPLATE_IN_USE | 409 | 사용 중인 정책 템플릿 |
+| 시스템 | SYS_INTERNAL_ERROR | 500 | 내부 서버 오류 |
+| | SYS_REDIS_UNAVAILABLE | 503 | Redis 장애 (DB Fallback) |
+| | SYS_RATE_LIMIT_EXCEEDED | 429 | API 호출 제한 초과 |
+
+---
+
+## 14. 프론트엔드 아키텍처
+
+### 14.1 기술 스택 및 선택 배경
+
+| 기술 | 선택 사유 |
+|------|----------|
+| **Next.js** | SSR/SSG/ISR로 초기 로딩 성능 최적화, 파일 기반 라우팅으로 생산성 향상 |
+| **TypeScript** | 정적 타이핑으로 컴파일 단계 오류 검출, IDE 자동 완성 강화 |
+| **Tailwind CSS** | Utility-First로 빠르고 일관된 UI 구축, CSS 비대화 방지 |
+| **TanStack Query** | 서버 상태 캐싱/동기화 핵심. SSE 실시간 데이터로 캐시 갱신, 낙관적 업데이트 |
+| **React Hook Form + Zod** | 비제어 컴포넌트로 리렌더링 최소화 + Zod 스키마로 런타임 타입 검증 |
+| **PWA** | 네이티브 앱 없이 설치 가능한 앱 + Service Worker 기반 푸시 알림 |
+
+> **왜 Next.js?** SSR/SSG/ISR로 초기 로딩 성능을 최적화하고, 파일 기반 라우팅으로 생산성을 높인다. React 생태계를 그대로 활용할 수 있다.
+
+> **왜 Turborepo 모노레포?** web-service(사용자)와 web-admin(관리자)이 공통 컴포넌트/타입/유틸을 공유해야 한다. 모노레포로 `packages/shared`를 두면 코드 중복 제거 + UI 일관성 보장. Turborepo의 캐싱으로 빌드 시간도 단축된다.
+
+> **왜 PWA?** 네이티브 앱 개발 리소스 없이 설치 가능한 앱 + 푸시 알림을 제공한다. Service Worker 기반 PWA Push로 차단/임계치 알림을 즉시 전달한다.
+
+> **왜 TanStack Query?** 서버 상태(사용량, 정책)의 캐싱/동기화가 핵심이다. SSE로 실시간 데이터를 받아 캐시를 갱신하고, 낙관적 업데이트로 슬라이더 조작의 체감 속도를 향상시킨다.
+
+> **왜 React Hook Form + Zod?** 비제어 컴포넌트로 리렌더링을 최소화하고, Zod 스키마로 TypeScript 타입과 런타임 검증을 하나의 스키마로 통일한다.
+
+### 14.2 프로젝트 구조
+
+```
+.
+├── apps
+│   ├── admin          (admin.dabom.site)
+│   │   └── src
+│   └── service        (www.dabom.site)
+│       └── src
+├── packages
+│   └── shared         (@repo/shared)
+│       └── src
+├── package.json
+├── pnpm-workspace.yaml
+├── tsconfig.json
+└── turbo.json
+```
+
+| 워크스페이스 | 서브도메인 | 설명 |
+|------------|-----------|------|
+| `apps/service` | `www.dabom.site` | 가족 사용자 서비스 (PWA) |
+| `apps/admin` | `admin.dabom.site` | 백오피스 관리 |
+
+### 14.3 워크스페이스 상세
+
+- **apps/admin**: 관리자 기능 (정책 CRUD, 가족 관리, 감사 로그). `@tanstack/react-query`, `dayjs`
+- **apps/service**: 사용자 서비스 (대시보드, 마이페이지, 알림). `chart.js`, `recharts`, `react-hot-toast`
+- **packages/shared**: 공용 UI Components (`Button`, `Badge`, `InputField`), Utils (`cn`, `http`), Types (`familyType`, `policyType`), Assets (SVG → React via `svgr`). `tsup`으로 CJS/ESM 번들링
+
+### 14.4 디자인 시스템
+
+**Color System**:
+
+| 토큰 | Hex | 용도 |
+|------|-----|------|
+| `primary-400` | `#fd3e97` | 브랜드 메인 (분홍) |
+| `primary-500` | `#e42068` | 브랜드 강조 |
+| `gray-100`~`gray-800` | `#eaeaea`~`#565656` | 무채색 스케일 |
+| `brand-white` | `#fdfdfe` | 배경 흰색 |
+| `brand-black` | `#101010` | 텍스트 검정 |
+| `bg-base` | `#f0f0f3` | 기본 배경 |
+
+**Typography**: Pretendard 폰트, Mobile/Desktop 별도 스케일 (display~caption, 0.75rem~3rem)
+
+### 14.5 백오피스 기능 명세
+
+| 도메인 | 기능 | 동작 |
+|--------|------|------|
+| 유저 | 로그인 | 이메일/비밀번호로 백오피스 접근 |
+| 정책 | 조회/생성/수정/삭제 | 활성화/비활성화 상태 관리, 정책 템플릿 CRUD |
+| 가족 | 리스트 조회 | 전체 가족 리스트, 대표자 1명 표시 |
+| | 상세 조회 | 가족 총 사용량, 구성원별 {이름, 권한, 사용량, 한도} |
+| | 권한 수정 | owner/member 전환, 19세 이상 자녀 권한 승격 |
+| | 한도 수정 | 구성원별 데이터 한도 강제 수정 (CS 목적) |
+| | 검색/필터 | 가족ID, 전화번호, 이름 + 최대 2가지 필터 조합 |
+
+### 14.6 유저 서비스 기능 명세
+
+| 도메인 | 기능 | 동작 |
+|--------|------|------|
+| 유저 | 로그인/로그아웃/탈퇴 | 전화번호+비밀번호, 토큰 삭제, 정보 영구 삭제 |
+| 대시보드 | 구성원별 사용량 | 현재 달: SSE 실시간, 과거 달: HTTP 분기 처리 |
+| 알림 | 누적 알림 | 지금까지 누적된 알림 확인 |
+| | 사용 경고 | 임계값(50/30/10%)에 따른 잔여량 경고 |
+| | 차단 알림 | 잔여량 소진 또는 강제 차단 시 알림 |
+| 마이페이지 | 내 사용량/정책 | 가로 막대그래프, 적용 정책 확인 |
+| 정책 관리 | 구성원 정책 조회/수정 | Owner 전용: 정책 변경 |
+| | 시간대 차단 | 휠 피커로 차단 시간 설정 |
+| | 데이터 한도 | 슬라이더 + 디바운싱, 실패 시 롤백 |
+| | 차단 토글 | 즉시 차단/해제 |
+| 차단 | 글로벌 차단 | SSE 차단 이벤트 수신 → 즉시 toast 표시 |
+
+---
+
+## 15. 비기능 요구사항
+
+### 15.1 확장성
+
+| 지표 | 예상 값 | 대응 전략 |
+|------|--------|----------|
+| 동시 접속자 | ~100,000 | SSE 서버 수평 확장 |
+| 초당 Usage Event | ~5,000 TPS | Kafka 파티션 확장 |
+| processor-usage 처리 | ~5,000 TPS | Consumer 인스턴스 = 파티션 수 (10개) |
+| 버스트 트래픽 | ~1,000,000 동시 | Kafka 버퍼링으로 흡수 |
+| 일일 이벤트 | ~4억 건 | RDS 파티셔닝, 콜드 아카이빙 |
+
+```mermaid
+flowchart LR
+    subgraph "simulator-usage"
+        TG["Kafka Producer"]
+    end
+
+    subgraph "Kafka Cluster"
+        P0["Partition 0"]
+        P1["Partition 1"]
+        PN["Partition N"]
+    end
+
+    TG --> P0
+    TG --> P1
+    TG --> PN
+
+    subgraph "processor-usage (Consumer Group)"
+        C0["Consumer 0"]
+        C1["Consumer 1"]
+        CN["Consumer N"]
+    end
+
+    P0 --> C0
+    P1 --> C1
+    PN --> CN
+
+    subgraph "Redis Cluster"
+        R1["Slot 0-5460"]
+        R2["Slot 5461-10922"]
+        R3["Slot 10923-16383"]
+    end
+
+    C0 --> R1
+    C1 --> R2
+    CN --> R3
+```
+
+### 15.2 장애 대응
+
+**Circuit Breaker 전체 적용**:
+
+| 대상 | 장애 감지 | Fallback |
+|------|----------|----------|
+| Redis | 연결 실패 3회 | MySQL Fallback |
+| Kafka | Producer 실패 3회 | 로컬 버퍼 + 재시도 |
+| MySQL | 쿼리 타임아웃 | Redis 캐시 조회 |
+| 외부 알림 | 발송 실패 3회 | DLQ + 수동 처리 |
+
+> **왜 Redis 장애 시 MySQL Fallback?** Redis Cluster 전체 장애는 극히 드물지만, 발생 시 서비스 중단 대신 MySQL Row Lock으로 동시성 제어하여 성능은 저하되지만 서비스를 유지한다. Fail-Open(무제한 허용)보다 정합성이 중요한 데이터 제어 시스템이므로 "Graceful Degradation"을 선택했다.
+
+> **왜 DLQ(Dead Letter Queue)?** 3회 실패한 이벤트를 무한 재시도하면 Consumer가 블로킹된다. DLQ에 격리하여 정상 이벤트 처리를 계속하고, 운영자가 수동으로 DLQ를 점검/재처리한다.
+
+**장애 시나리오별 대응**:
+
+| 장애 시나리오 | 대응 전략 |
+|--------------|----------|
+| Kafka 브로커 장애 | 3개 이상 브로커, replication.factor=3 |
+| processor-usage 장애 | Consumer Group 리밸런싱, 자동 복구 |
+| Redis 노드 장애 | Cluster 모드, MySQL Fallback |
+| RDS 장애 | 읽기 전용 Replica, Redis 캐시로 서비스 유지 |
+
+### 15.3 데이터 정합성
+
+| 시나리오 | 대응 |
+|----------|------|
+| 이벤트 유실 | 유실 허용, Batch 정산으로 보정 |
+| Redis-RDS 불일치 | Write-Behind 비동기, 주기적 Reconciliation |
+| 중복 이벤트 | eventId 기반 Idempotency (Redis + RDS) |
+
+> **왜 이벤트 유실을 허용하고 Batch 정산?** Kafka `acks=1`(Leader만)으로 처리량을 우선한다. 극소수 유실 이벤트는 매일 새벽 3시 Redis-RDS Reconciliation으로 보정한다. 100% 무손실보다 처리량과 지연시간이 중요한 트레이드오프이다.
+
+### 15.4 보안 및 권한
+
+| 항목 | 구현 |
+|------|------|
+| 인증 | JWT 자체 구현 (Access + Refresh Token) |
+| 인가 | RBAC (Member, Owner — 복수 가능, Admin). Last Write Wins, audit_log 이력 |
+| DDoS 방어 | AWS WAF 자동 차단 |
+| Rate Limiting | 동적 제한 (시스템 부하에 따라 조정) |
+| 감사 로그 | 모든 정책 변경 이력 기록 |
+
+---
+
+## 16. 인프라 아키텍처
+
+### 16.1 AWS 기반 배포 구성
+
+```mermaid
+flowchart TB
+    subgraph "Edge"
+        CF["CloudFront CDN"]
+        WAF["AWS WAF"]
+    end
+
+    subgraph "AWS VPC"
+        subgraph "Public Subnet"
+            ALB["Application<br/>Load Balancer"]
+        end
+
+        subgraph "Private Subnet - Compute"
+            subgraph "ECS Fargate"
+                AC["api-core<br/>Replicas: 3"]
+                UP["processor-usage<br/>Replicas: 10"]
+                AN["api-notification<br/>Replicas: 2"]
+            end
+        end
+
+        subgraph "Private Subnet - Data"
+            MSK["Amazon MSK<br/>(Kafka)"]
+            EC["ElastiCache<br/>(Redis Cluster)"]
+            RDS["Amazon RDS<br/>(MySQL)"]
+        end
+    end
+
+    CF --> WAF
+    WAF --> ALB
+    ALB --> AC
+    ALB --> AN
+
+    AC --> RDS
+    AC --> EC
+    AC --> MSK
+    UP --> MSK
+    UP --> EC
+    UP --> RDS
+    AN --> MSK
+```
+
+> **Note**: simulator-usage는 별도 환경(온프레미스/EC2)에서 실행되며, MSK로 직접 이벤트 발행
+
+### 16.2 서비스별 배포 구성
+
+| 서비스 | 배포 환경 | Replicas | 리소스 |
+|--------|----------|----------|--------|
+| api-core | ECS Fargate | 3 | 2 vCPU, 4GB |
+| processor-usage | ECS Fargate | 10 | 2 vCPU, 4GB |
+| api-notification | ECS Fargate | 2 | 1 vCPU, 2GB |
+| simulator-usage | EC2 / 온프레미스 | 1-3 | 가변 |
+| web-service | CloudFront + S3 | - | Static (www.dabom.site) |
+| web-admin | CloudFront + S3 | - | Static (admin.dabom.site) |
+
+> **왜 ECS Fargate?**: 서버리스 컨테이너로 인프라 관리 부담 최소화. 트래픽에 따라 Auto Scaling이 자동 동작하며, Kubernetes 대비 운영 복잡도가 낮아 7인 팀에 적합
+
+> **왜 web-core를 서브도메인 분리 배포?**: `www.dabom.site`(사용자)와 `admin.dabom.site`(관리자)를 분리하면 독립 배포가 가능하고, CloudFront 캐시 정책도 역할별로 최적화 가능
+
+### 16.3 모니터링 및 관측성 (Observability)
+
+| 영역 | 도구 | 용도 |
+|------|------|------|
+| **로그** | CloudWatch Logs / ELK | 애플리케이션 로그 수집 |
+| **메트릭** | Prometheus + Grafana | 시스템 메트릭 시각화 |
+| **트레이싱** | Jaeger / X-Ray | 분산 추적 |
+| **알림** | PagerDuty / Slack | 장애 알림 |
+
+> **왜 Prometheus + Grafana?**: 오픈소스 기반으로 비용 부담 없이 메트릭 수집/시각화 가능. Grafana 대시보드로 Kafka Consumer Lag, Redis 응답시간, TPS 등을 실시간 모니터링
+
+#### 핵심 메트릭 및 임계값
+
+| 메트릭 | 임계값 | 알림 채널 |
+|--------|--------|----------|
+| processor-usage 처리 지연 | > 100ms (P99) | Slack 알림 |
+| Kafka Consumer Lag | > 10,000 | PagerDuty |
+| Redis 응답 시간 | > 5ms (P99) | Slack 알림 |
+| 차단 비율 급증 | > 10% (1분간) | Slack 알림 |
+| 에러율 | > 1% | PagerDuty |
+
+---
+
+## 17. 테스트 전략
+
+### 17.1 simulator-usage 시나리오
+
+| 시나리오 | 설정 | 검증 포인트 |
+|----------|------|------------|
+| 기본 부하 | 고정 RPS 5,000 | 처리량, 지연 시간 |
+| 랜덤 이벤트 | 무작위 familyId/customerId | 순서 보장, 정합성 |
+
+### 17.2 부하 테스트 계획
+
+| 단계 | TPS | 지속 시간 | 목표 |
+|------|-----|----------|------|
+| Warm-up | 1,000 | 5분 | 시스템 안정화 |
+| Normal | 5,000 | 30분 | 정상 운영 확인 |
+| Peak | 10,000 | 10분 | 피크 대응 확인 |
+| Stress | 15,000 | 5분 | 한계점 파악 |
+
+> **왜 3단계 부하 테스트 도구 전략?**:
+> - **1단계 kafka-producer-perf-test**: MSK 인프라 자체의 한계점을 먼저 확인 (인프라 병목 분리)
+> - **2단계 simulator-usage (Go)**: 실제 도메인 페이로드로 E2E 파이프라인 검증 (도메인 시나리오)
+> - **3단계 k6**: api-core/api-notification HTTP API 부하 테스트 (API 레벨)
+>
+> 각 계층을 분리하여 병목 구간을 정확히 식별할 수 있음
+
+### 17.3 장애 테스트 시나리오
+
+| 시나리오 | 테스트 방법 | 예상 결과 |
+|----------|-----------|----------|
+| Redis 장애 | 노드 강제 종료 | MySQL Fallback 전환 |
+| Kafka 브로커 장애 | 브로커 1개 종료 | 자동 리밸런싱 |
+| processor-usage 장애 | 인스턴스 강제 종료 | Consumer Group 리밸런싱 |
+| 네트워크 지연 | tc를 통한 지연 주입 | 타임아웃 처리 확인 |
+| 버스트 트래픽 | 100만 동시 이벤트 발행 | Kafka 버퍼링, Lag 증가 후 정상 처리 |
+| usage-persist 자기소비 지연 | Consumer Lag 인위 증가 | Write-Behind 지연 허용, 최종 정합성 확인 |
+
+### 17.4 테스트 커버리지 목표
+
+- **목표**: 70%
+- **필수 테스트 영역**: 동시성 제어 Lua Script, 정책 엔진, Idempotency
+
+---
+
+## 18. 알림 정책
+
+### 18.1 알림 트리거 조건
+
+| 트리거 | 알림 대상 | 알림 내용 | 이벤트 |
+|--------|----------|----------|--------|
+| 잔여 50% 도달 | 전체 가족 | "가족 데이터가 50% 남았습니다" | notification-events (THRESHOLD_ALERT) |
+| 잔여 30% 도달 | 전체 가족 | "가족 데이터가 30% 남았습니다" | notification-events (THRESHOLD_ALERT) |
+| 잔여 10% 도달 | 전체 가족 | "가족 데이터가 10% 미만입니다!" | notification-events (THRESHOLD_ALERT) |
+| 개인 한도 초과 | 해당 구성원 + Owner | "데이터 한도 초과로 차단됩니다" | notification-events (CUSTOMER_BLOCKED) |
+| 시간대 차단 시작 | 차단 대상 | "야간 차단이 활성화되었습니다" | notification-events (CUSTOMER_BLOCKED) |
+| 시간대 차단 종료 | 차단 대상 | "야간 차단이 해제되었습니다" | notification-events (CUSTOMER_UNBLOCKED) |
+| 정책 변경 | 영향받는 구성원 | "데이터 정책이 변경되었습니다" | policy-updated |
+
+### 18.2 알림 채널
+
+| 채널 | 전달 방식 | 지연 |
+|------|----------|------|
+| **인앱 알림** | SSE 기반 실시간 스트림 | 즉시 |
+| **PWA 푸시 알림** | Service Worker 기반 | 즉시 |
+
+### 18.3 중복 발송 방지
+
+- **임계치당 1회**: 50%, 30%, 10% 각 임계치별로 한 번만 발송
+- **Redis 기록**: `family:{familyId}:alert:threshold:{value}` 키로 발송 기록 (TTL: quota reset까지)
+
+> **왜 임계치당 1회만?**: 잔여량이 경계 근처에서 오르내릴 때 알림 폭풍(Notification Storm) 방지. Redis TTL 기반 발송 기록으로 간단하게 구현하며, 월간 리셋 시점에 TTL이 자동 만료되어 다음 월에는 다시 알림 가능
+
+---
+
+## 19. 구현 로드맵 (7주)
+
+### Phase 1: Core Engine & Pipeline (1-3주차) — "흐르게 하라"
+
+가장 리스크가 큰 트래픽 처리와 **동시성 제어**(최우선 기능)를 먼저 검증합니다.
+
+**W1 (설계 및 세팅)**
+- Kafka 토픽 설계 (`usage-events`, `policy-updated`, `notification-events`, `usage-persist`)
+- Redis Cluster 구성 및 Lua Script 프로토타이핑
+- simulator-usage 제작: 고정 RPS 랜덤 이벤트 생성
+
+**W2 (수집 및 제어)**
+- simulator-usage 구현 (eventId 생성, Kafka 직접 발행)
+- processor-usage 핵심 로직 (Kafka Consumer, 검증, Redis Lua Script, 선착순 완전 승인)
+- "Last 10MB" 동시성 테스트 수행
+
+**W3 (시각화 및 연동)**
+- SSE 서버 구현
+- 기본 프론트엔드 연동 (실시간 대시보드)
+
+### Phase 2: Business Logic & Admin (4-5주차) — "제어하라"
+
+**W4 (정책 고도화)**
+- 동적 정책 적용 (Owner가 한도 변경 시 Redis 값 즉시 갱신)
+- 시간대별 차단 정책 (KST 기준)
+- 가족 구성원 권한 관리 (RBAC)
+- JWT 인증 시스템 구현
+
+**W5 (백오피스 & 정산)**
+- Admin API 개발 (정책 CRUD, 개별 가족 수정)
+- Write-Behind 패턴: Kafka를 통한 RDS 비동기 저장
+- 상세 분석 리포트 구현
+
+### Phase 3: Reliability & Optimization (6-7주차) — "견고하게 하라"
+
+**W6 (안정성)**
+- Circuit Breaker 전체 적용 (Redis, Kafka 포함)
+- DB Fallback: Redis 장애 시 MySQL 전환
+- Dead Letter Queue(DLQ) 처리: 3회 실패 시 DLQ
+- Flyway 자동 마이그레이션
+
+**W7 (최종 검증)**
+- 부하 테스트 (simulator-usage)
+- 전체 Observability 구성 (로그 + 메트릭 + 트레이싱)
+- 테스트 커버리지 70% 달성
+- 최종 발표 자료 및 데모 준비
+
+> **왜 Phase 1에서 동시성 제어를 최우선?**: 가장 리스크가 큰 기술적 난제(Redis Lua Script, Kafka 순서 보장, "Last 10MB")를 먼저 검증해야 이후 비즈니스 로직 구현의 기반이 됨. 실패 시 아키텍처 전면 재설계가 필요하므로 조기 검증이 핵심. "가장 어려운 것을 먼저, 가장 확실하지 않은 것을 먼저"
+
+---
+
+## 20. R&R (역할 분담)
+
+### 20.1 Backend 역할 분담 (5인)
+
+| 역할 | 담당 영역 | 주요 기술 스택 & 책임 |
+|------|----------|----------------------|
+| **BE 1 (Core)** | Policy Engine & Concurrency | Redis(Lua), Kafka Consumer, 동시성 제어 (최우선) |
+| **BE 2 (Ingest)** | Traffic Gateway & Simulator | Kafka Producer, simulator-usage 개발 (Go) |
+| **BE 3 (Biz)** | Family Service & API | Spring Boot, JPA, JWT 인증, SSE |
+| **BE 4 (Data)** | Settlement & Persistence | Write-Behind, MySQL, Flyway |
+| **BE 5 (Ops)** | Backoffice & DevOps | Admin API, Docker/K8s, Observability |
+
+### 20.2 Frontend 역할 분담 (2인)
+
+| 역할 | 담당 영역 | 주요 기술 스택 |
+|------|----------|---------------|
+| **FE 1** | web-service (가족 앱, www.dabom.site) | Next.js, TypeScript, Tailwind, SSE, PWA |
+| **FE 2** | web-admin (백오피스, admin.dabom.site) | Next.js, TypeScript, Tailwind |
+
+---
+
+## 21. 용어집 (Glossary)
+
+### 21.1 도메인 용어
+
+#### 사용자 관련
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 가족 그룹 | Family Group | 데이터를 공유하는 사용자들의 집합. 최대 10명까지 구성 가능 |
+| 가족 구성원 | Family Member | 가족 그룹에 속한 일반 사용자. 데이터 조회만 가능 |
+| Owner 계정 | Owner | 가족 그룹 내 정책 수정 권한을 가진 관리 사용자. 복수 Owner 가능 (`family_member.role='OWNER'` 기준) |
+| 운영자 | Backoffice Admin | 시스템 전체를 관리하는 내부 관리자 |
+
+#### 데이터 관련
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 할당량 | Quota | 사용자 또는 그룹에 할당된 데이터 한도 (바이트 단위) |
+| 잔여량 | Remaining | 사용 가능한 남은 데이터량 |
+| 사용량 | Usage | 실제로 사용한 데이터량 |
+| 월별 한도 | Monthly Limit | 한 달 동안 사용할 수 있는 최대 데이터량 |
+| 임계치 | Threshold | 알림을 발송하는 기준점 (50%, 30%, 10%) |
+
+#### 정책 관련
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 정책 | Policy | 데이터 사용에 적용되는 규칙 (한도, 시간대 차단 등) |
+| 시간대 차단 | Time Block | 특정 시간대(예: 22:00~07:00)에 데이터 사용을 차단하는 정책 |
+| 즉시 차단 | Manual Block | Owner가 특정 구성원의 데이터 사용을 즉시 차단하는 기능 |
+| 앱별 차단 | App Block | 특정 앱/서비스의 데이터 사용을 차단하는 정책 (MVP 제외) |
+| 선착순 완전 승인 | First-Come-First-Served | 동시 요청 시 먼저 도착한 요청만 전체 승인, 나머지는 즉시 차단 |
+| 기본 규칙 | Default Rules | 정책 템플릿에 정의된 기본 규칙 JSON (`default_rules`). 적용 시 `POLICY_ASSIGNMENT.rules`로 복사 |
+| 최소 역할 | Require Role | 정책 적용을 받을 수 있는 최소 역할 (`require_role`). MEMBER 또는 OWNER |
+| 정책 활성화 | Is Active | 정책 템플릿의 활성/비활성 상태 (DB: `is_activate`, API: `isActive`). FALSE이면 신규 적용 불가 |
+
+#### 알림 관련
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 임계치 알림 | Threshold Alert | 잔여량이 특정 임계치(50/30/10%)에 도달했을 때 발송되는 알림 |
+| 차단 알림 | Block Notification | 사용자가 차단되었을 때 발송되는 알림 |
+| 정책 변경 알림 | Policy Update Notification | 정책이 변경되었을 때 영향받는 사용자에게 발송되는 알림 |
+| 임계치당 1회 | Once Per Threshold | 각 임계치별로 한 번만 알림을 발송하는 정책 |
+
+#### API 도메인 관련
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 마이페이지 | MyPage | 로그인한 사용자 본인의 사용량 및 적용 정책을 조회하는 개인 영역 |
+| 데이터 차단/허용 | Data Block | Owner가 특정 구성원의 데이터 사용을 즉시 차단 또는 허용하는 통합 기능 |
+| 정책 템플릿 | Policy Template | 관리자(admin)가 생성/관리하는 재사용 가능한 정책 정의 |
+| REST 알림 조회 | REST Notification | SSE 실시간 알림과 병행하여 알림 이력을 REST API로 조회하는 기능 |
+| 고객 | Customer | 시스템의 일반 사용자 (가족 구성원). 기존 USER 테이블에서 CUSTOMER로 분리 |
+| 구성원 월별 할당량 | Customer Quota | 구성원별 월별 데이터 한도와 사용량, 차단 상태를 관리하는 엔티티 |
+
+### 21.2 기술 용어
+
+#### 아키텍처 패턴
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 이벤트 기반 아키텍처 | Event-Driven Architecture (EDA) | 이벤트의 발생, 감지, 처리를 중심으로 설계된 아키텍처 패턴 |
+| Write-Behind | Write-Behind Pattern | 먼저 캐시(Redis)에 기록하고, 나중에 비동기로 DB에 반영하는 패턴 |
+| 자기소비 패턴 | Self-Consumption Pattern | 동일 서비스가 Kafka 토픽에 발행한 뒤 같은 토픽을 직접 소비하는 패턴 |
+| Soft Delete | Soft Delete | 물리적 삭제 대신 `deleted_at` 컬럼에 삭제 시각을 기록하는 논리 삭제 방식 |
+| 멱등성 | Idempotency | 동일 요청을 여러 번 처리해도 결과가 같은 성질 |
+
+#### 데이터 처리
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 원자 연산 | Atomic Operation | 분리할 수 없는 단일 단위로 실행되는 연산. 전부 성공하거나 전부 실패 |
+| 파티션 키 | Partition Key | Kafka에서 메시지를 파티션에 분배하는 기준이 되는 키 (familyId) |
+| 컨슈머 그룹 | Consumer Group | 동일한 토픽을 구독하는 컨슈머들의 집합 |
+| 컨슈머 랙 | Consumer Lag | 메시지 발행 속도와 처리 속도의 차이로 발생하는 지연 |
+| DLQ | Dead Letter Queue | 처리에 실패한 메시지를 저장하는 별도의 큐 |
+
+#### Redis 데이터 설계
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 런타임 제약 | Runtime Constraints | 다양한 정책이 계산되어 실제 적용될 제약 조건의 모음. Redis Hash에 `ACTION:TYPE` 형태의 Field로 저장 |
+| 이벤트 봉투 | Event Envelope | 모든 Kafka 이벤트를 감싸는 공통 래퍼 구조. Jackson `@JsonTypeInfo` 활용 다형성 역직렬화 지원 |
+| 정책 키 | Policy Key | 런타임 제약의 Field Name 표준. `ACTION:TYPE:TARGET` 형태 (예: `LIMIT:DATA:DAILY`, `BLOCK:APP:com.youtube`) |
+| Poly-Policy Engine | Poly-Policy Engine | Redis Lua Script 기반의 다중 정책 평가 엔진. constraints Hash를 동적으로 순회하며 코드 수정 없이 정책 평가 |
+
+#### 동시성 제어
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 분산 락 | Distributed Lock | 여러 서버에서 동시에 같은 리소스에 접근하는 것을 방지하는 잠금 메커니즘 |
+| Lua 스크립트 | Lua Script | Redis에서 여러 명령을 원자적으로 실행하기 위해 사용하는 스크립트 |
+| CAS | Compare-And-Set | 현재 값을 비교하고 일치할 때만 새 값으로 설정하는 원자 연산 |
+
+#### 장애 대응
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 서킷 브레이커 | Circuit Breaker | 장애가 발생한 서비스에 대한 호출을 일시적으로 차단하는 패턴 |
+| 폴백 | Fallback | 주 시스템 장애 시 대체 시스템으로 전환하는 것 |
+| Fail-Open | Fail-Open | 장애 시 제한 없이 허용하는 정책 (사용성 우선) |
+| Fail-Closed | Fail-Closed | 장애 시 모든 요청을 차단하는 정책 (안전 우선) |
+| 지수 백오프 | Exponential Backoff | 재시도 간격을 점진적으로 늘리는 전략 (1초, 5초, 30초 등) |
+
+#### 데이터 보관
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| Batch 정산 | Reconciliation | Redis와 RDS 간 데이터 불일치를 주기적으로 보정하는 작업. 매일 새벽 3시 실행 |
+| 계층형 보관 | Tiered Storage (Hot/Warm/Cold) | 데이터 접근 빈도에 따라 저장소를 분리. Hot(7일: Redis+RDS), Warm(90일: RDS), Cold(90일+: S3) |
+
+#### 실시간 통신
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| SSE | Server-Sent Events | 서버에서 클라이언트로 단방향 실시간 스트림을 전송하는 기술 |
+| WebSocket | WebSocket | 서버와 클라이언트 간 양방향 실시간 통신을 지원하는 프로토콜 |
+| PWA | Progressive Web App | 웹 기술로 구현된 네이티브 앱 같은 웹 애플리케이션 |
+
+### 21.3 시스템 컴포넌트
+
+| 컴포넌트 | 역할 |
+|----------|------|
+| **simulator-usage** | 실시간 데이터 소모 이벤트 시뮬레이터. eventId 생성 후 Kafka로 직접 발행 |
+| **processor-usage** | 이벤트 검증, 중복 체크, 정책평가/쿼터차감, Redis Atomic, usage-persist 자기소비(Write-Behind), notification-events 발행 |
+| **api-core** | 5개 도메인 REST API, JWT familyId 추론, 정책 즉시 반영 트리거 |
+| **api-notification** | notification-events consumer, SSE API + REST 알림 조회 API, 실시간 알림 Push |
+| **web-core** | Turborepo 기반 프론트엔드 모노레포 (web-service + web-admin + shared) |
+| **web-service** | 가족 사용자 PWA (www.dabom.site) |
+| **web-admin** | 백오피스 관리 UI (admin.dabom.site) |
+
+### 21.4 이벤트 타입
+
+| 이벤트 | 설명 |
+|--------|------|
+| `usage-events` | 데이터 사용 이벤트 (simulator-usage → Kafka → processor-usage) |
+| `policy-updated` | 정책 변경 이벤트 (api-core → processor-usage) |
+| `notification-events` | 통합 알림 이벤트 (processor-usage → api-notification). subType: QUOTA_UPDATED, CUSTOMER_BLOCKED, THRESHOLD_ALERT |
+| `usage-persist` | DB 저장용 이벤트 (processor-usage → Kafka → processor-usage 자기소비 → MySQL) |
+
+### 21.5 약어 정의
+
+| 약어 | 전체 표현 | 의미 |
+|------|----------|------|
+| TPS | Transactions Per Second | 초당 트랜잭션 수 |
+| SSE | Server-Sent Events | 서버에서 클라이언트로의 단방향 스트림 |
+| PWA | Progressive Web App | 설치 가능한 웹 앱 |
+| JWT | JSON Web Token | JSON 기반 인증 토큰 |
+| RBAC | Role-Based Access Control | 역할 기반 접근 제어 |
+| DLQ | Dead Letter Queue | 실패 메시지 저장 큐 |
+| TTL | Time To Live | 데이터 유효 기간 |
+| RDS | Relational Database Service | 관계형 데이터베이스 서비스 |
+| MSK | Managed Streaming for Apache Kafka | AWS 관리형 Kafka |
+| ECS | Elastic Container Service | AWS 컨테이너 서비스 |
+| ALB | Application Load Balancer | 애플리케이션 로드 밸런서 |
+| WAF | Web Application Firewall | 웹 애플리케이션 방화벽 |
+| CDN | Content Delivery Network | 콘텐츠 전송 네트워크 |
+| KST | Korea Standard Time | 한국 표준시 |
+| P99 | 99th Percentile | 상위 99% 기준값 |
+| ADR | Architecture Decision Record | 아키텍처 결정 기록 |
+
+### 21.6 다중 Owner 관련
+
+| 용어 (한글) | 용어 (영문) | 정의 |
+|------------|------------|------|
+| 다중 Owner | Multiple Owners | 한 가족 그룹 내에 복수의 OWNER 역할 구성원이 존재하는 구조 |
+| Last Write Wins | LWW | 복수 OWNER가 동일 정책을 동시에 수정할 경우, 마지막으로 수정한 값이 적용. 모든 변경은 `audit_log`에 기록 |
+| 그룹 생성자 | Created By | 가족 그룹을 최초로 생성한 사용자. 이력/감사 전용으로 OWNER 권한 판단에는 사용하지 않음 |
+
+### 21.7 차단 사유 코드
+
+| 코드 | 설명 |
+|------|------|
+| `MONTHLY_LIMIT_EXCEEDED` | 월별 한도 초과 |
+| `FAMILY_QUOTA_EXCEEDED` | 가족 할당량 소진 |
+| `TIME_BLOCK` | 시간대 차단 정책 |
+| `MANUAL` | Owner에 의한 수동 차단 |
+| `APP_BLOCK` | 앱별 차단 정책 (MVP 제외) |
+
+---
+
+> **DABOM 팀** | URECA 프로젝트 | 2026
