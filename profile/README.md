@@ -345,9 +345,9 @@ sequenceDiagram
 | 영역 | 기술 | 선정 사유 |
 |------|------|----------|
 | **simulator-usage** | Go | 고성능 이벤트 펌프, goroutine 동시성, 단일 바이너리 ~20MB |
-| **processor-usage** | Spring Boot / Go | 복잡한 비즈니스 로직 + Kafka Consumer, Redis Atomic |
+| **processor-usage** | Spring Boot | 복잡한 비즈니스 로직 + Kafka Consumer, Redis Atomic |
 | **api-core** | Spring Boot | 풍부한 생태계, JPA, JWT 인증 |
-| **api-notification** | Node.js / Spring Boot | SSE 비동기 처리, notification-events consumer |
+| **api-notification** | Spring Boot | SSE 비동기 처리, notification-events consumer |
 | **Kafka** | Apache Kafka | 대용량 이벤트 스트림, familyId 순서 보장, 버스트 흡수 |
 | **Redis** | Redis Cluster | 원자 연산(Lua Script), 저지연 캐시 |
 | **MySQL** | Amazon RDS | JSON 지원, Read 성능, 팀 숙련도 |
@@ -436,9 +436,9 @@ flowchart TB
 | 컴포넌트 | 역할 | 기술 스택 |
 |---------|------|----------|
 | **simulator-usage** | 데이터 사용 이벤트 시뮬레이션, eventId 생성, Kafka 직접 발행 | Go |
-| **processor-usage** | Kafka 소비, 검증, 중복 체크, 정책평가/쿼터차감, Write-Behind 자기소비, 알림 발행 | Spring Boot / Go |
+| **processor-usage** | Kafka 소비, 검증, 중복 체크, 정책평가/쿼터차감, Write-Behind 자기소비, 알림 발행 | Spring Boot |
 | **api-core** | 5개 도메인 REST API, JWT familyId 추론, 정책 즉시 반영 트리거 | Spring Boot |
-| **api-notification** | notification-events consumer, SSE + REST 알림 API, PWA Push | Node.js / Spring Boot |
+| **api-notification** | notification-events consumer, SSE + REST 알림 API, PWA Push | Spring Boot |
 | **web-service** | 가족 사용자 PWA (www.dabom.site) | Next.js + PWA |
 | **web-admin** | 백오피스 관리 UI (admin.dabom.site) | Next.js |
 
