@@ -174,14 +174,14 @@ sequenceDiagram
 └─ API 호출: PATCH /families/policies
 
 [T1] api-core 처리
-├─ RDS에 정책 원본 저장 (Source of Truth)
-├─ Redis constraints Hash 즉시 갱신
-│   └─ HSET family:{id}:customer:{cid}:constraints LIMIT:DATA:MONTHLY 536870912
+├─ RDS POLICY_ASSIGNMENT 갱신
 ├─ policy-updated 이벤트 발행 (Kafka)
 └─ 응답: 200 OK
 
 [T2] processor-usage 정책 즉시 반영
 ├─ policy-updated 이벤트 수신
+├─ Redis constraints Hash 갱신
+│   └─ HSET family:{id}:customer:{cid}:constraints LIMIT:DATA:MONTHLY 536870912
 ├─ 현재 사용량(1.2GB) vs 신규 한도(500MB) 비교
 ├─ 사용량 > 한도 → 즉시 차단
 │   └─ HSET family:{id}:customer:{cid}:constraints BLOCK:ACCESS "1"
@@ -204,7 +204,7 @@ sequenceDiagram
 ├─ 부모 → web-service에서 시간대 차단 정책 등록
 ├─ 대상: 자녀1, 자녀2
 ├─ 차단 시간: 22:00 ~ 07:00 (서버 시간 KST 기준)
-└─ api-core → RDS 저장 + Redis 캐시 + policy-updated 발행
+└─ api-core → RDS 저장 + policy-updated 발행
 
 [T1] 22:00 도달 (정책 활성화)
 ├─ Lua Script가 constraints의 BLOCK:TIME:START/END 확인
@@ -260,7 +260,7 @@ sequenceDiagram
 | 필드 | DB 컬럼 | 설명 |
 |------|---------|------|
 | 정책 설명 | `description` | 정책 템플릿의 상세 설명. 프론트엔드 툴팁 표시용 |
-| 최소 요구 역할 | `require_role` | `MEMBER`이면 모든 구성원에게 적용 가능, `OWNER`이면 OWNER만 대상 |
+| 최소 설정 권한 | `require_role` | `MEMBER`이면 MEMBER 이상이 설정 가능, `OWNER`이면 OWNER만 설정 가능 |
 | 기본 규칙 | `default_rules` | 정책 타입별 기본 규칙 JSON |
 | 활성화 여부 | `is_activate` | FALSE이면 정책 목록에서 제외되며 신규 적용 불가 |
 
@@ -283,7 +283,7 @@ sequenceDiagram
 |------|------|------------|
 | 가족 통합 대시보드 | 가족 잔여 데이터량, 구성원별 사용 비중 시각화 | SSE |
 | 개인 사용량 상세 | 시간대별/앱별/구성원별 상세 분석 리포트 | SSE |
-| 알림 센터 | 잔여량 경고, 차단 알림, 정책 변경 알림 | PWA Push |
+| 알림 센터 | 잔여량 경고, 차단 알림, 정책 변경 알림 | 1차: SSE (브라우저 접속 중 Push, 미접속 시 재접속 시 일괄 전송) / 2차: SSE + Web Push (FCM, 브라우저 꺼져도 OS 레벨 알림) |
 | 차단 상태 표시 | 즉시 차단 화면 (차단 사유, 부모 연락처) | SSE |
 
 #### Owner 전용 기능
@@ -349,7 +349,7 @@ sequenceDiagram
 | **api-core** | Spring Boot 3.4 / Java 21 | 풍부한 생태계, JPA, JWT 인증 |
 | **api-notification** | Spring Boot 3.4 / Java 21 | SSE 비동기 처리, notification-events consumer |
 | **Kafka** | Apache Kafka (Amazon MSK) | 대용량 이벤트 스트림, familyId 순서 보장, 버스트 흡수 |
-| **Redis** | Redis Cluster (ElastiCache) | 원자 연산(Lua Script), 저지연 캐시 |
+| **Redis** | Redis Sentinel (ElastiCache) | 원자 연산(Lua Script), 저지연 캐시 |
 | **MySQL** | Amazon RDS | JSON 지원, Read 성능, 팀 숙련도 |
 | **web-core** | Next.js + Turborepo | SSR, 모노레포 코드 공유 (web-service + web-admin) |
 | **Container** | Docker + ECS Fargate | 오케스트레이션, 오토스케일링 |
@@ -462,7 +462,7 @@ flowchart TB
 |---------|------|----------|
 | **simulator-usage** | 데이터 사용 이벤트 시뮬레이션, eventId 생성, Kafka 직접 발행 | Go |
 | **processor-usage** | Kafka 소비, 검증, 중복 체크, 정책평가/쿼터차감, Write-Behind 자기소비, 알림 발행 | Spring Boot |
-| **api-core** | 5개 도메인 REST API, JWT familyId 추론, 정책 즉시 반영 트리거 | Spring Boot |
+| **api-core** | 5개 도메인 REST API, JWT 인증, 정책 즉시 반영 트리거 | Spring Boot |
 | **api-notification** | notification-events consumer, SSE + REST 알림 API, PWA Push | Spring Boot |
 | **web-service** | 가족 사용자 PWA (www.dabom.site) | Next.js + PWA |
 | **web-admin** | 백오피스 관리 UI (admin.dabom.site) | Next.js |
@@ -612,7 +612,7 @@ public abstract class BaseEntity {
 public enum RoleType {
     MEMBER,   // 일반 가족 구성원
     OWNER,    // Owner 계정 (복수 가능)
-    ADMIN     // 백오피스 운영자
+    ADMIN     // 백오피스 운영자 — FamilyMember에서는 MEMBER/OWNER만 사용, ADMIN은 별도 ADMIN 테이블 인증 체계
 }
 
 public enum PolicyType {
@@ -810,7 +810,7 @@ usage-persist (Topic) → UsagePersistKafkaConsumer → UsagePersistService.pers
 1. JWT 인증/인가 처리 (Access 30분 / Refresh 7일)
 2. 가족/구성원 관리 API
 3. 정책 CRUD API
-4. 정책 변경 시 **RDS + Redis + Kafka 동시 갱신** (즉시 반영)
+4. 정책 변경 시 **RDS 갱신 + Kafka 이벤트 발행** (Redis는 processor-usage가 갱신)
 5. API 버전 관리 (Accept-Version 헤더)
 6. SSE 실시간 사용량 Push (`usage-realtime` 토픽 소비 → SseEmitter)
 
@@ -827,7 +827,7 @@ usage-persist (Topic) → UsagePersistKafkaConsumer → UsagePersistService.pers
 **역할**: notification-events 소비, SSE 실시간 알림 전달, PWA Push
 
 **책임**:
-1. Kafka `notification-events` 토픽 소비 (subType: QUOTA_UPDATED, CUSTOMER_BLOCKED, THRESHOLD_ALERT)
+1. Kafka `notification-events` 토픽 소비 (subType: CUSTOMER_BLOCKED, THRESHOLD_ALERT)
 2. 중복 알림 방지 (임계치당 1회)
 3. SSE API 실시간 스트림 전송
 4. PWA Push 알림 발송
@@ -869,7 +869,7 @@ flowchart LR
 
 **파티셔닝 전략**:
 - `usage-events`, `policy-updated`: familyId 기반 파티셔닝
-- 파티션 수: **10개** (processor-usage 인스턴스 수와 동일)
+- 파티션 수: **10개** (processor-usage 오토스케일 최대 인스턴스 수와 동일)
 
 > **왜 familyId를 파티션 키로?** 동일 가족의 이벤트가 같은 파티션에 들어가야 순서가 보장된다. "Last 10MB" 시나리오에서 아빠→엄마→자녀 순서가 뒤바뀌면 동시성 제어가 깨진다.
 
@@ -992,15 +992,6 @@ public record PolicyUpdatedPayload(
 
 `eventType`은 `NOTIFICATION`으로 고정, `subType`으로 구분:
 
-**QUOTA_UPDATED** (잔여량 갱신):
-```json
-{ "subType": "QUOTA_UPDATED", "payload": {
-    "familyId": 100, "customerId": 12345,
-    "familyRemainingBytes": 53681848320, "familyUsedPercent": 50.5,
-    "customerUsedBytesToday": 10485760
-} }
-```
-
 **CUSTOMER_BLOCKED** (사용자 차단):
 ```json
 { "subType": "CUSTOMER_BLOCKED", "payload": {
@@ -1021,11 +1012,7 @@ public record PolicyUpdatedPayload(
 
 ```java
 public sealed interface NotificationPayload
-    permits QuotaUpdatedPayload, CustomerBlockedPayload, ThresholdAlertPayload {}
-
-public record QuotaUpdatedPayload(Long familyId, Long customerId,
-    Long familyRemainingBytes, Double familyUsedPercent, Long customerUsedBytesToday
-) implements NotificationPayload {}
+    permits CustomerBlockedPayload, ThresholdAlertPayload {}
 
 public record CustomerBlockedPayload(Long familyId, Long customerId,
     String blockReason, String blockedAt
@@ -1039,8 +1026,6 @@ public record ThresholdAlertPayload(Long familyId, Integer thresholdPercent,
 @KafkaListener(topics = "notification-events")
 public void handleNotification(EventEnvelope<NotificationPayload> event) {
     switch (event.payload()) {
-        case QuotaUpdatedPayload(var fid, var uid, var rem, var pct, var today) ->
-            sendQuotaPush(uid, pct);
         case CustomerBlockedPayload(var fid, var uid, var reason, var at) ->
             sendBlockPush(uid, reason);
         case ThresholdAlertPayload(var fid, var pct, var msg) ->
@@ -1127,7 +1112,7 @@ sequenceDiagram
     alt 허용 (선착순 완전 승인)
         RD-->>UP: allowed: true
         UP->>KF: usage-persist 발행 (Write-Behind)
-        UP->>KF: notification-events 발행 (QUOTA_UPDATED)
+        UP->>KF: usage-realtime 발행 (대시보드 갱신)
     else 차단
         RD-->>UP: allowed: false
         UP->>KF: notification-events 발행 (CUSTOMER_BLOCKED)
@@ -1159,18 +1144,13 @@ sequenceDiagram
     OW->>WS: 자녀 한도 변경 (2GB → 500MB)
     WS->>AC: PATCH /families/policies
 
-    par 병렬 처리
-        AC->>DB: 정책 원본 저장 (Source of Truth)
-    and
-        AC->>RD: 캐시 즉시 갱신
-    and
-        AC->>KF: policy-updated 발행
-    end
-
+    AC->>DB: 정책 원본 저장 (Source of Truth)
+    AC->>KF: policy-updated 발행
     AC-->>WS: 200 OK
     WS-->>OW: 변경 완료 표시
 
     KF->>UP: policy-updated 수신
+    UP->>RD: Redis constraints Hash 갱신
     UP->>UP: 메모리 정책 캐시 갱신
     Note over UP: 이후 모든 usage-events는<br/>최신 정책으로 평가됨
     UP->>RD: 소급 적용 검사
@@ -1182,7 +1162,7 @@ sequenceDiagram
     end
 ```
 
-> **왜 api-core가 RDS + Redis + Kafka를 병렬로 갱신?** RDS는 Source of Truth(영속), Redis는 실시간 판정용 캐시, Kafka는 processor-usage에 정책 변경을 전파한다. 3곳을 동시에 갱신해야 "다음 이벤트부터 즉시 적용"이 보장된다.
+> **왜 api-core가 RDS + Kafka만 갱신?** RDS는 Source of Truth(영속), Kafka는 processor-usage에 정책 변경을 전파한다. Redis는 processor-usage가 policy-updated 이벤트를 수신한 후 갱신하므로, api-core는 RDS 저장과 Kafka 발행만 담당한다.
 
 ### 10.3 알림 발송 흐름
 
@@ -1366,7 +1346,7 @@ flowchart TD
 
 | 저장소 | 역할 | 특징 |
 |--------|------|------|
-| **Redis Cluster** | 실시간 캐시, 동시성 제어, 상태 관리 | 원자 연산(Lua Script), 저지연, 휘발성 |
+| **Redis Sentinel** | 실시간 캐시, 동시성 제어, 상태 관리 | 원자 연산(Lua Script), 저지연, 휘발성 |
 | **MySQL** | 영속 데이터, 원본(Source of Truth), 감사 로그 | ACID 보장, 장기 보관, 복잡한 쿼리 |
 | **Kafka** | 이벤트 백본, 비동기 메시징 | 순서 보장, 재처리 가능, 이력 보관 |
 | **S3** | 콜드 데이터 아카이브 | 저비용 장기 보관 |
@@ -1755,7 +1735,7 @@ flowchart LR
 3. 동일 processor-usage가 `usage-persist`를 소비하여 배치 수집 (5초/100건)
 4. MySQL에 Bulk Insert
 
-#### Batch 정산 (Reconciliation)
+#### Batch를 활용한 보정 (Reconciliation)
 
 매일 새벽 3시 Redis-RDS 불일치 보정:
 
@@ -1796,8 +1776,8 @@ WHERE customer_id = ? AND family_id = ? AND current_month = ? AND deleted_at IS 
 | 계층 | 기간 | 저장소 | 용도 |
 |------|------|--------|------|
 | **Hot** | 7일 | Redis + RDS | 실시간 조회, 대시보드 |
-| **Warm** | 90일 | RDS | 리포트, 분석 |
-| **Cold** | 90일+ | S3 (Parquet) | 장기 보관, 감사 |
+| **Warm** | 180일 | RDS | 리포트, 분석 |
+| **Cold** | 180일+ | S3 (Parquet) | 장기 보관, 감사 |
 
 ### 12.7 인덱스 설계 + 파티셔닝
 
@@ -1826,7 +1806,7 @@ CREATE TABLE usage_record (
 );
 ```
 
-> **왜 usage_record를 월별 파티셔닝?** 일일 4억 건(5,000 TPS x 86,400초) 규모에서 단일 테이블은 쿼리 성능이 급락한다. 월별 파티셔닝으로 조회 범위를 제한하고, 90일+ 데이터는 파티션 단위로 S3에 아카이브한다.
+> **왜 usage_record를 월별 파티셔닝?** 일일 4억 건(5,000 TPS x 86,400초) 규모에서 단일 테이블은 쿼리 성능이 급락한다. 월별 파티셔닝으로 조회 범위를 제한하고, 180일+ 데이터는 파티션 단위로 S3에 아카이브한다.
 
 ### 12.8 마이그레이션 전략 (Flyway)
 
@@ -1864,11 +1844,11 @@ db/migration/
 
 > **왜 Accept-Version 헤더 방식? (vs URL /v1/)** URL 버전은 경로가 변경되어 클라이언트 수정 범위가 크다. Accept-Version 헤더는 URL을 깔끔하게 유지하면서 서버에서 버전별 라우팅이 가능하다.
 
-> **왜 JWT 자체 구현? (vs OAuth 2.0 / 소셜 로그인)** 가족 데이터 제어 시스템에서 외부 인증 의존은 장애 전파 위험이 있다. 자체 JWT로 `familyId`, `role`을 토큰에 포함하면 매 요청마다 DB 조회 없이 권한 판단이 가능하다.
+> **왜 JWT 자체 구현? (vs OAuth 2.0 / 소셜 로그인)** 가족 데이터 제어 시스템에서 외부 인증 의존은 장애 전파 위험이 있다. 자체 JWT로 customerId, role을 토큰에 포함하면 매 요청마다 DB 조회 없이 사용자 식별이 가능하다. familyId는 DB에서 조회한다.
 
 **JWT Payload**:
 ```json
-{ "customerId": 12345, "familyId": 100, "role": "OWNER", "exp": 1705312200 }
+{ "sub": "12345", "role": "OWNER", "exp": 1705312200 }
 ```
 
 **공통 응답 형식**:
@@ -1939,7 +1919,8 @@ db/migration/
 
 #### api-core SSE (실시간 사용량)
 
-- `GET /families/usage/current` — 가족 총 사용량 실시간 Push
+- `GET /families/usage/current` — 가족 총 사용량 실시간 Push → Event: `usage-updated`
+- `GET /families/usage/customers` — 구성원별 사용량 실시간 Push → Event: `usage-updated-by-member`
 - `SseEmitter` 기반 (`UsageSseEmitterRegistry`)
 - Spring `ApplicationEvent` → `@EventListener` → SSE Push
 - `usage-realtime` Kafka 토픽 소비 → 실시간 대시보드 갱신
@@ -1956,7 +1937,6 @@ db/migration/
 
 | Event | Data 형식 |
 |-------|----------|
-| QUOTA_UPDATED | `{"remainingBytes":..., "usedPercent":...}` |
 | CUSTOMER_BLOCKED | `{"customerId":..., "blockReason":..., "blockedAt":...}` |
 | THRESHOLD_ALERT | `{"threshold":50, "remainingPercent":48.5, "message":...}` |
 | CUSTOMER_UNBLOCKED | `{"customerId":..., "reason":..., "unblockedAt":...}` |
@@ -2121,10 +2101,10 @@ flowchart LR
     P1 --> C1
     PN --> CN
 
-    subgraph "Redis Cluster"
-        R1["Slot 0-5460"]
-        R2["Slot 5461-10922"]
-        R3["Slot 10923-16383"]
+    subgraph "Redis Sentinel"
+        R1["Master"]
+        R2["Replica 1"]
+        R3["Replica 2"]
     end
 
     C0 --> R1
@@ -2143,7 +2123,7 @@ flowchart LR
 | MySQL | 쿼리 타임아웃 | Redis 캐시 조회 |
 | 외부 알림 | 발송 실패 3회 | DLQ + 수동 처리 |
 
-> **왜 Redis 장애 시 MySQL Fallback?** Redis Cluster 전체 장애는 극히 드물지만, 발생 시 서비스 중단 대신 MySQL Row Lock으로 동시성 제어하여 성능은 저하되지만 서비스를 유지한다. Fail-Open(무제한 허용)보다 정합성이 중요한 데이터 제어 시스템이므로 "Graceful Degradation"을 선택했다.
+> **왜 Redis 장애 시 MySQL Fallback?** Redis Sentinel 전체 장애는 극히 드물지만, 발생 시 서비스 중단 대신 MySQL Row Lock으로 동시성 제어하여 성능은 저하되지만 서비스를 유지한다. Fail-Open(무제한 허용)보다 정합성이 중요한 데이터 제어 시스템이므로 "Graceful Degradation"을 선택했다.
 
 > **왜 DLQ(Dead Letter Queue)?** 3회 실패한 이벤트를 무한 재시도하면 Consumer가 블로킹된다. DLQ에 격리하여 정상 이벤트 처리를 계속하고, 운영자가 수동으로 DLQ를 점검/재처리한다.
 
@@ -2153,18 +2133,18 @@ flowchart LR
 |--------------|----------|
 | Kafka 브로커 장애 | 3개 이상 브로커, replication.factor=3 |
 | processor-usage 장애 | Consumer Group 리밸런싱, 자동 복구 |
-| Redis 노드 장애 | Cluster 모드, MySQL Fallback |
+| Redis 노드 장애 | Sentinel 모드, MySQL Fallback |
 | RDS 장애 | 읽기 전용 Replica, Redis 캐시로 서비스 유지 |
 
 ### 15.3 데이터 정합성
 
 | 시나리오 | 대응 |
 |----------|------|
-| 이벤트 유실 | 유실 허용, Batch 정산으로 보정 |
+| 이벤트 유실 | 유실 허용, Batch를 활용한 보정 |
 | Redis-RDS 불일치 | Write-Behind 비동기, 주기적 Reconciliation |
 | 중복 이벤트 | eventId 기반 Idempotency (Redis + RDS) |
 
-> **왜 이벤트 유실을 허용하고 Batch 정산?** Kafka `acks=1`(Leader만)으로 처리량을 우선한다. 극소수 유실 이벤트는 매일 새벽 3시 Redis-RDS Reconciliation으로 보정한다. 100% 무손실보다 처리량과 지연시간이 중요한 트레이드오프이다.
+> **왜 이벤트 유실을 허용하고 Batch를 활용한 보정?** Kafka `acks=1`(Leader만)으로 처리량을 우선한다. 극소수 유실 이벤트는 매일 새벽 3시 Redis-RDS Reconciliation으로 보정한다. 100% 무손실보다 처리량과 지연시간이 중요한 트레이드오프이다.
 
 ### 15.4 보안 및 권한
 
@@ -2312,7 +2292,7 @@ flowchart TB
 
         subgraph "Private Subnet - Data"
             MSK["Amazon MSK<br/>(Kafka)"]
-            EC["ElastiCache<br/>(Redis Cluster)"]
+            EC["ElastiCache<br/>(Redis Sentinel)"]
             RDS["Amazon RDS<br/>(MySQL)"]
         end
     end
@@ -2452,7 +2432,7 @@ flowchart TB
 
 **W1 (설계 및 세팅)**
 - Kafka 토픽 설계 (`usage-events`, `policy-updated`, `notification-events`, `usage-persist`)
-- Redis Cluster 구성 및 Lua Script 프로토타이핑
+- Redis Sentinel 구성 및 Lua Script 프로토타이핑
 - simulator-usage 제작: 고정 RPS 랜덤 이벤트 생성
 
 **W2 (수집 및 제어)**
@@ -2467,7 +2447,7 @@ flowchart TB
 ### Phase 2: Business Logic & Admin (4-5주차) — "제어하라"
 
 **W4 (정책 고도화)**
-- 동적 정책 적용 (Owner가 한도 변경 시 Redis 값 즉시 갱신)
+- 동적 정책 적용 (Owner가 한도 변경 시 RDS 갱신 + Kafka 전파 → processor-usage가 Redis 반영)
 - 시간대별 차단 정책 (KST 기준)
 - 가족 구성원 권한 관리 (RBAC)
 - JWT 인증 시스템 구현
@@ -2549,7 +2529,7 @@ flowchart TB
 | 앱별 차단 | App Block | 특정 앱/서비스의 데이터 사용을 차단하는 정책 (MVP 제외) |
 | 선착순 완전 승인 | First-Come-First-Served | 동시 요청 시 먼저 도착한 요청만 전체 승인, 나머지는 즉시 차단 |
 | 기본 규칙 | Default Rules | 정책 템플릿에 정의된 기본 규칙 JSON (`default_rules`). 적용 시 `POLICY_ASSIGNMENT.rules`로 복사 |
-| 최소 역할 | Require Role | 정책 적용을 받을 수 있는 최소 역할 (`require_role`). MEMBER 또는 OWNER |
+| 최소 설정 권한 | Require Role | 정책을 설정할 수 있는 최소 역할 (`require_role`). MEMBER이면 MEMBER 이상이 설정 가능, OWNER이면 OWNER만 설정 가능 |
 | 정책 활성화 | Is Active | 정책 템플릿의 활성/비활성 상태 (DB: `is_activate`, API: `isActive`). FALSE이면 신규 적용 불가 |
 
 #### 알림 관련
@@ -2625,8 +2605,8 @@ flowchart TB
 
 | 용어 (한글) | 용어 (영문) | 정의 |
 |------------|------------|------|
-| Batch 정산 | Reconciliation | Redis와 RDS 간 데이터 불일치를 주기적으로 보정하는 작업. 매일 새벽 3시 실행 |
-| 계층형 보관 | Tiered Storage (Hot/Warm/Cold) | 데이터 접근 빈도에 따라 저장소를 분리. Hot(7일: Redis+RDS), Warm(90일: RDS), Cold(90일+: S3) |
+| Batch를 활용한 보정 | Reconciliation | Redis와 RDS 간 데이터 불일치를 주기적으로 보정하는 작업. 매일 새벽 3시 실행 |
+| 계층형 보관 | Tiered Storage (Hot/Warm/Cold) | 데이터 접근 빈도에 따라 저장소를 분리. Hot(7일: Redis+RDS), Warm(180일: RDS), Cold(180일+: S3) |
 
 #### 실시간 통신
 
@@ -2642,7 +2622,7 @@ flowchart TB
 |----------|------|
 | **simulator-usage** | 실시간 데이터 소모 이벤트 시뮬레이터. eventId 생성 후 Kafka로 직접 발행 |
 | **processor-usage** | 이벤트 검증, 중복 체크, 정책평가/쿼터차감, Redis Atomic, usage-persist 자기소비(Write-Behind), notification-events 발행 |
-| **api-core** | 5개 도메인 REST API, JWT familyId 추론, 정책 즉시 반영 트리거 |
+| **api-core** | 5개 도메인 REST API, JWT 인증, 정책 즉시 반영 트리거 |
 | **api-notification** | notification-events consumer, SSE API + REST 알림 조회 API, 실시간 알림 Push |
 | **web-core** | Turborepo 기반 프론트엔드 모노레포 (web-service + web-admin + shared) |
 | **web-service** | 가족 사용자 PWA (www.dabom.site) |
@@ -2654,7 +2634,7 @@ flowchart TB
 |--------|------|
 | `usage-events` | 데이터 사용 이벤트 (simulator-usage → Kafka → processor-usage) |
 | `policy-updated` | 정책 변경 이벤트 (api-core → processor-usage) |
-| `notification-events` | 통합 알림 이벤트 (processor-usage → api-notification). subType: QUOTA_UPDATED, CUSTOMER_BLOCKED, THRESHOLD_ALERT |
+| `notification-events` | 통합 알림 이벤트 (processor-usage → api-notification). subType: CUSTOMER_BLOCKED, THRESHOLD_ALERT |
 | `usage-persist` | DB 저장용 이벤트 (processor-usage → Kafka → processor-usage 자기소비 → MySQL) |
 
 ### 21.5 약어 정의
