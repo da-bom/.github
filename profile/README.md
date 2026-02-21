@@ -1746,12 +1746,12 @@ db/migration/
 
 | 토큰 | Hex | 용도 |
 |------|-----|------|
-| `primary-400` | `#fd3e97` | 브랜드 메인 (분홍) |
-| `primary-500` | `#e42068` | 브랜드 강조 |
-| `gray-100`~`gray-800` | `#eaeaea`~`#565656` | 무채색 스케일 |
-| `brand-white` | `#fdfdfe` | 배경 흰색 |
-| `brand-black` | `#101010` | 텍스트 검정 |
-| `bg-base` | `#f0f0f3` | 기본 배경 |
+| `primary-400` | `#fd3e97` | ![#fd3e97](https://placehold.co/15x15/fd3e97/fd3e97.png) |
+| `primary-500` | `#e42068` | ![#e42068](https://placehold.co/15x15/e42068/e42068.png) |
+| `gray-100` | `#eaeaea` | ![#eaeaea](https://placehold.co/15x15/eaeaea/eaeaea.png) |
+| `brand-white` | `#fdfdfe` | ![#fdfdfe](https://placehold.co/15x15/fdfdfe/fdfdfe.png) |
+| `brand-black` | `#101010` | ![#101010](https://placehold.co/15x15/101010/101010.png) |
+| `bg-base`     | `#f0f0f3` | ![#f0f0f3](https://placehold.co/15x15/f0f0f3/f0f0f3.png) |
 
 **Typography**: Pretendard 폰트, Mobile/Desktop 별도 스케일 (display~caption, 0.75rem~3rem)
 
