@@ -16,21 +16,21 @@
 4. [핵심 시나리오](#4-핵심-시나리오)
 5. [정책 유형 정의](#5-정책-유형-정의)
 6. [기능 요구사항](#6-기능-요구사항)
-7. [시스템 아키텍처](#7-시스템-아키텍처)
-8. [핵심 컴포넌트 상세 설계](#8-핵심-컴포넌트-상세-설계)
-9. [이벤트 백본 설계 (Kafka)](#9-이벤트-백본-설계-kafka)
+7. [시스템 아키텍처](#7-시스템-아키텍처) — 기술 스택 상세, 백엔드 프로젝트 구조, 서비스별 도메인 구성
+8. [핵심 컴포넌트 상세 설계](#8-핵심-컴포넌트-상세-설계) — processor-usage 상태 판정, 정책 동기화, DB 영속화 상세
+9. [이벤트 백본 설계 (Kafka)](#9-이벤트-백본-설계-kafka) — 5개 토픽 (usage-realtime 포함)
 10. [데이터 플로우 (E2E)](#10-데이터-플로우-e2e)
 11. [동시성 제어 전략](#11-동시성-제어-전략)
-12. [데이터 모델](#12-데이터-모델)
-13. [API 명세](#13-api-명세)
+12. [데이터 모델](#12-데이터-모델) — RedisTemplate 구성, 캐시 전략
+13. [API 명세](#13-api-명세) — api-core + api-notification SSE 분리, JWT AOP
 14. [프론트엔드 아키텍처](#14-프론트엔드-아키텍처)
-15. [비기능 요구사항](#15-비기능-요구사항)
+15. [비기능 요구사항](#15-비기능-요구사항) — 코드 품질, Observability, 환경 변수, 빌드
 16. [인프라 아키텍처](#16-인프라-아키텍처)
 17. [테스트 전략](#17-테스트-전략)
 18. [알림 정책](#18-알림-정책)
 19. [구현 로드맵 (7주)](#19-구현-로드맵-7주)
 20. [R&R (역할 분담)](#20-rr-역할-분담)
-21. [용어집](#21-용어집)
+21. [용어집 (Glossary)](#21-용어집-Glossary)
 
 ---
 
@@ -345,15 +345,37 @@ sequenceDiagram
 | 영역 | 기술 | 선정 사유 |
 |------|------|----------|
 | **simulator-usage** | Go | 고성능 이벤트 펌프, goroutine 동시성, 단일 바이너리 ~20MB |
-| **processor-usage** | Spring Boot | 복잡한 비즈니스 로직 + Kafka Consumer, Redis Atomic |
-| **api-core** | Spring Boot | 풍부한 생태계, JPA, JWT 인증 |
-| **api-notification** | Spring Boot | SSE 비동기 처리, notification-events consumer |
-| **Kafka** | Apache Kafka | 대용량 이벤트 스트림, familyId 순서 보장, 버스트 흡수 |
-| **Redis** | Redis Cluster | 원자 연산(Lua Script), 저지연 캐시 |
+| **processor-usage** | Spring Boot 3.4 / Java 21 | 복잡한 비즈니스 로직 + Kafka Consumer, Redis Atomic |
+| **api-core** | Spring Boot 3.4 / Java 21 | 풍부한 생태계, JPA, JWT 인증 |
+| **api-notification** | Spring Boot 3.4 / Java 21 | SSE 비동기 처리, notification-events consumer |
+| **Kafka** | Apache Kafka (Amazon MSK) | 대용량 이벤트 스트림, familyId 순서 보장, 버스트 흡수 |
+| **Redis** | Redis Cluster (ElastiCache) | 원자 연산(Lua Script), 저지연 캐시 |
 | **MySQL** | Amazon RDS | JSON 지원, Read 성능, 팀 숙련도 |
 | **web-core** | Next.js + Turborepo | SSR, 모노레포 코드 공유 (web-service + web-admin) |
 | **Container** | Docker + ECS Fargate | 오케스트레이션, 오토스케일링 |
-| **Observability** | Prometheus + Grafana + Jaeger | 로그/메트릭/트레이싱 통합 |
+| **Observability** | Micrometer + Prometheus + Grafana + Jaeger | 로그/메트릭/트레이싱 통합 |
+
+#### 백엔드 공통 기술 스택 (상세)
+
+| 항목 | 기술 | 버전 |
+|------|------|------|
+| Framework | Spring Boot | 3.4 |
+| Language | Java | 21 |
+| ORM | Spring Data JPA + QueryDSL | 5.1 |
+| Cache | Spring Data Redis | - |
+| Messaging | Spring Kafka | - |
+| Build | Gradle (Groovy DSL) | Java 21 Toolchain |
+| Container | Docker Multi-stage | eclipse-temurin:21-jdk → eclipse-temurin:21-jre |
+| Observability | Micrometer + Prometheus + OpenTelemetry | - |
+| Logging | Logstash Logback Encoder | 구조화된 JSON 로그 |
+
+#### 서비스별 추가 스택
+
+| 서비스 | 추가 기술 |
+|--------|----------|
+| api-core | JWT (jjwt 0.11.2), Springdoc OpenAPI (Swagger), SSE (SseEmitter) |
+| processor-usage | Redis Lua Script (원자적 연산) |
+| api-notification | JWT (jjwt 0.11.2), Springdoc OpenAPI (Swagger), SSE (SseEmitter) |
 
 ### 7.3 전체 아키텍처 다이어그램
 
@@ -387,7 +409,7 @@ flowchart TB
     end
 
     subgraph EVENT["Event Backbone"]
-        KF[["Kafka Cluster<br/>usage-events | policy-updated | usage-persist | notification-events"]]
+        KF[["Kafka Cluster<br/>usage-events | policy-updated | usage-persist | usage-realtime | notification-events"]]
         class KF event
     end
 
@@ -425,6 +447,9 @@ flowchart TB
     UP -->|usage-persist| KF
     KF -->|usage-persist| UP
     UP -->|MySQL Write-Behind| DB
+
+    UP -->|usage-realtime| KF
+    KF -->|usage-realtime| AC
 
     UP -->|notification-events| KF
     KF -->|notification-events| AN
@@ -469,8 +494,8 @@ flowchart TB
                            │                │
 ┌─────────────────────────────────────────────────────────────┐
 │              Event Backbone (버스트 흡수)                    │
-│     Kafka: usage-events | policy-updated | usage-persist    │
-│                    | notification-events                    │
+│  Kafka: usage-events | policy-updated | usage-persist      │
+│         | usage-realtime | notification-events              │
 └─────────────────────────────────────────────────────────────┘
                            │
 ┌─────────────────────────────────────────────────────────────┐
@@ -483,6 +508,134 @@ flowchart TB
 │       Redis (Realtime)          MySQL (Persist)             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### 7.6 백엔드 프로젝트 구조
+
+#### 패키지 구조 (Feature-Based Layered Architecture)
+
+3개 백엔드 서비스 공통 구조:
+
+```
+com.project
+├─ Application.java
+├─ domain/{feature}/
+│   ├─ controller/          # REST 엔드포인트 (api-core, api-notification)
+│   ├─ service/             # Interface + Impl 구조
+│   │   └─ port/            # 인프라 추상화 인터페이스
+│   ├─ repository/          # Spring Data JPA
+│   │   └─ impl/            # QueryDSL 구현체
+│   ├─ entity/              # JPA 엔티티
+│   ├─ enums/               # 도메인 Enum
+│   ├─ dto/
+│   │   ├─ request/         # 요청 DTO (Java record)
+│   │   └─ response/        # 응답 DTO (Java record + static from())
+│   └─ infra/               # 인프라 어댑터
+│       ├─ cache/           # Redis 캐시 Repository
+│       ├─ messaging/       # Kafka Producer/Consumer
+│       ├─ event/           # Spring ApplicationEvent (api-core)
+│       └─ sse/             # SSE Emitter Registry (api-core)
+└─ global/
+    ├─ config/              # Redis, Kafka, JPA, QueryDSL, Swagger, CORS, Cache
+    ├─ exception/           # ExceptionAdvice, BaseException, ErrorCode
+    ├─ auth/                # JWT 인증/인가, AOP (api-core, api-notification)
+    ├─ api/response/        # ApiResponse<T> 공통 응답 래퍼
+    ├─ event/dto/           # 공유 Kafka 이벤트 Payload DTO
+    └─ util/                # BaseEntity, RedisKeyGenerator
+```
+
+> **왜 Feature-Based Layered?** 기능(도메인)별로 패키지를 나누면 관련 코드가 한 폴더에 모여 응집도가 높다. 순수 계층별(controller/, service/, repository/) 구조는 파일이 흩어져 기능 추가 시 여러 패키지를 오가야 한다.
+
+#### 의존성 방향 (단방향만 허용)
+
+```
+# api-core
+Controller → Service → Repository → Entity
+
+# processor-usage (REST API 없음)
+Consumer → Service → Repository → Entity
+                  → Redis (Lua Script)
+                  → Producer (이벤트 발행)
+
+# api-notification
+Controller → Service → Repository → Entity
+Consumer → Service → SseEmitterManager (SSE 푸시)
+```
+
+#### 서비스별 도메인 구성
+
+**api-core**:
+
+| 도메인 | 패키지 | 역할 |
+|--------|--------|------|
+| customer | `domain/customer` | 사용자 인증(로그인), 사용량/정책 조회 |
+| admin | `domain/admin` | 관리자 인증(로그인), 백오피스 관리 |
+| family | `domain/family` | 가족 그룹 관리, 대시보드, 검색, SSE 실시간 사용량 |
+| policy | `domain/policy` | 정책 템플릿 CRUD, 가족 구성원 정책 적용/수정 |
+| usagerecord | `domain/usagerecord` | 사용량 기록 관리, SSE 실시간 스트림 |
+
+**processor-usage**:
+
+| 도메인 | 패키지 | 역할 |
+|--------|--------|------|
+| usage | `domain/usage` | 사용량 이벤트 수신, Redis Lua Script 실시간 처리, 이벤트 팬아웃 |
+| policy | `domain/policy` | 정책 변경 이벤트 수신, Redis 제약 조건 동기화 |
+| family | `domain/family` | 가족 그룹 정보 관리, Redis 캐시 저장/조회 |
+| customer | `domain/customer` | 고객 엔티티 및 월별 할당량(CustomerQuota) 관리 |
+| notification | `domain/notification` | 알림 이벤트 발행 (Sealed Interface 기반 다형 알림) |
+
+**api-notification**:
+
+| 도메인 | 패키지 | 역할 |
+|--------|--------|------|
+| notification | `domain/notification` | SSE 실시간 알림 + REST 알림 이력 조회 |
+| customer | `domain/customer` | 고객 엔티티, 할당량(CustomerQuota) |
+| family | `domain/family` | 가족 그룹 엔티티, 구성원 매핑 |
+
+#### 공통 BaseEntity
+
+```java
+@EntityListeners(AuditingEntityListener.class)
+@MappedSuperclass
+public abstract class BaseEntity {
+    @CreatedDate  private LocalDateTime createdAt;
+    @LastModifiedDate  private LocalDateTime updatedAt;
+    private LocalDateTime deletedAt;
+
+    public void softDelete() { this.deletedAt = LocalDateTime.now(); }
+    public boolean isDeleted() { return this.deletedAt != null; }
+}
+```
+
+#### 핵심 Enum
+
+```java
+public enum RoleType {
+    MEMBER,   // 일반 가족 구성원
+    OWNER,    // Owner 계정 (복수 가능)
+    ADMIN     // 백오피스 운영자
+}
+
+public enum PolicyType {
+    MONTHLY_LIMIT,   // 월별 한도
+    TIME_BLOCK,      // 시간대 차단
+    MANUAL_BLOCK,    // 즉시 차단
+    APP_BLOCK,       // 앱별 차단
+    WEBSITE_BLOCK    // 웹사이트 차단
+}
+```
+
+#### 핵심 엔티티 예상 규모
+
+| 엔티티 | 테이블 | 예상 규모 |
+|--------|--------|----------|
+| Customer | `customer` | ~1,000,000 |
+| Family | `family` | ~250,000 |
+| FamilyMember | `family_member` | ~1,000,000 |
+| CustomerQuota | `customer_quota` | ~1,000,000/월 |
+| UsageRecord | `usage_record` | ~432,000,000/일 |
+| Policy | `policy` | ~100 |
+| PolicyAssignment | `policy_assignment` | ~500,000 |
+| NotificationLog | `notification_log` | ~수백만/월 |
 
 ---
 
@@ -571,6 +724,84 @@ Kafka(usage-persist) → processor-usage 자기소비 → MySQL Bulk Insert
 
 > **왜 processor-usage가 usage-persist를 자기소비(Self-Consumption)?** 별도 서비스로 분리하면 운영 복잡도가 증가한다. processor-usage가 이미 처리 컨텍스트를 갖고 있으므로, 같은 프로세스에서 배치 수집(5초/100건) 후 Bulk Insert하는 것이 가장 효율적이다.
 
+#### 사용량 처리 상세 흐름 (UsageSyncService)
+
+```
+UsageEventsConsumer
+  1. ConsumerRecord 수신
+  2. EventEnvelope<UsagePayload> 역직렬화
+  3. UsageEventValidator 검증
+  4. UsageSyncService.syncUsage() 위임
+       │
+       ▼
+  Redis Lua Script (usage_update.lua) 실행
+  1. 개인 제약 조건(BLOCK:ACCESS) 확인
+  2. 개인 월간 한도(LIMIT:DATA:MONTHLY) 초과 확인
+  3. 가족 잔여량 부족 확인
+  4. 가족 잔여량 차감 (DECRBY)
+  5. 개인 월간 사용량 증가 (INCRBY)
+  6. 임계치 경고 판정 (WARNING_10/30/50)
+  7. 경고 중복 발송 방지 (HEXISTS/HSET)
+       │
+       ▼
+  3개 토픽 팬아웃 발행
+  ├─ usage-persist (DB Write-Behind)
+  ├─ usage-realtime (대시보드 갱신)
+  └─ notification-events (알림, 조건부)
+```
+
+#### 사용량 상태 판정
+
+| 상태 | 의미 | 트리거 조건 | 후속 동작 |
+|------|------|------------|----------|
+| `NORMAL` | 정상 | 차단/경고 해당 없음 | Persist + Realtime 발행 |
+| `WARNING_10` | 잔여 10% 미만 | 잔여/총량 < 0.1 (최초 1회) | + ThresholdAlert 발행 |
+| `WARNING_30` | 잔여 30% 미만 | 잔여/총량 < 0.3 (최초 1회) | + ThresholdAlert 발행 |
+| `WARNING_50` | 잔여 50% 미만 | 잔여/총량 < 0.5 (최초 1회) | + ThresholdAlert 발행 |
+| `BLOCKED_ACCESS` | 완전 차단 | `constraints[BLOCK:ACCESS] == "1"` | + CustomerBlocked 발행 |
+| `BLOCKED_LIMIT_MONTHLY` | 월간 한도 초과 | 월간 사용량 + bytesUsed > limit | + CustomerBlocked 발행 |
+| `BLOCKED_FAMILY_QUOTA` | 가족 데이터 소진 | 가족 잔여량 < bytesUsed | + CustomerBlocked 발행 |
+
+#### 정책 제약 조건 동기화
+
+```
+PolicyKafkaConsumer
+  1. policy-updated 토픽 수신
+  2. POLICY_UPDATED 타입만 처리
+  3. PolicyConstraintSyncService.sync() 위임
+       │
+       ▼
+  Redis Lua Script (policy_constraint_update.lua) 실행
+  1. 이벤트 중복 방지 (SET NX EX)
+  2. 버전 비교 (stale event 방어)
+  3. HSET 또는 HDEL 수행
+  결과: APPLIED / DUPLICATE / STALE / INVALID_REQUEST
+```
+
+#### 허용된 정책 키 (Whitelist)
+
+| 정책 키 | 값 형식 | 설명 |
+|---------|---------|------|
+| `BLOCK:ACCESS` | `"0"` / `"1"` | 완전 접근 차단 |
+| `BLOCK:TIME:START` | `"HHmm"` | 시간대 차단 시작 |
+| `BLOCK:TIME:END` | `"HHmm"` | 시간대 차단 종료 |
+| `THROTTLE:SPEED` | 양의 정수 (bytes/s) | 속도 제한 |
+| `BLOCK:APP:{appId}` | `"0"` / `"1"` | 특정 앱 차단 |
+| `LIMIT:DATA:{period}` | 양의 정수 (bytes) | 데이터 한도 |
+
+#### DB 영속화 (Write-Behind) 상세
+
+```
+usage-persist (Topic) → UsagePersistKafkaConsumer → UsagePersistService.persist()
+  1. USAGE_PERSIST 타입 확인
+  2. payload 필수값 검증
+  3. Redis 중복 이벤트 방지 (setIfAbsent, Redis 장애 시 DB 저장 허용)
+  4. eventTime에서 KST 기준 월 추출
+  5. CustomerQuota UPDATE 시도
+  6. UPDATE 0건이면 INSERT (과거 최신 monthlyLimitBytes 승계)
+  7. INSERT 경합 시 UPDATE 재시도
+```
+
 ### 8.3 api-core (Command/Query API)
 
 **역할**: 정책/권한 CRUD, 대시보드 조회, 인증
@@ -581,8 +812,15 @@ Kafka(usage-persist) → processor-usage 자기소비 → MySQL Bulk Insert
 3. 정책 CRUD API
 4. 정책 변경 시 **RDS + Redis + Kafka 동시 갱신** (즉시 반영)
 5. API 버전 관리 (Accept-Version 헤더)
+6. SSE 실시간 사용량 Push (`usage-realtime` 토픽 소비 → SseEmitter)
 
-**기술 스택**: Spring Boot
+**인가 AOP 어노테이션**:
+
+| 어노테이션 | 역할 | 설명 |
+|------------|------|------|
+| `@AdminOnly` | admin | 관리자 전용 엔드포인트 보호 |
+| `@OwnerOnly` | owner | Owner 전용 엔드포인트 보호 |
+| `@CustomerId` | member | JWT에서 customerId를 추출하여 파라미터에 주입 |
 
 ### 8.4 api-notification (SSE API)
 
@@ -610,6 +848,7 @@ flowchart LR
         T2["policy-updated<br/>━━━━━━━━━<br/>파티션 키: familyId"]
         T3["notification-events<br/>━━━━━━━━━<br/>통합 알림 이벤트"]
         T4["usage-persist<br/>━━━━━━━━━<br/>Write-Behind용"]
+        T5["usage-realtime<br/>━━━━━━━━━<br/>대시보드 갱신용"]
     end
 
     TG[simulator-usage] -->|직접 발행| T1
@@ -620,9 +859,11 @@ flowchart LR
 
     UP -->|발행| T3
     UP -->|발행| T4
+    UP -->|발행| T5
 
     T3 --> AN[api-notification]
     T4 -->|자기소비| UP
+    T5 --> AC2[api-core SSE Push]
     UP -->|MySQL Write-Behind| DB[(MySQL)]
 ```
 
@@ -647,7 +888,7 @@ flowchart LR
 ```json
 {
   "eventId": "evt_550e8400-...",
-  "eventType": "DATA_USAGE | POLICY_UPDATED | USAGE_PERSIST | NOTIFICATION",
+  "eventType": "DATA_USAGE | POLICY_UPDATED | USAGE_PERSIST | NOTIFICATION | USAGE_REALTIME",
   "subType": null,
   "timestamp": "2026-02-06T14:30:00Z",
   "payload": { }
@@ -671,7 +912,8 @@ public record EventEnvelope<T>(
         @JsonSubTypes.Type(value = UsagePayload.class, name = "DATA_USAGE"),
         @JsonSubTypes.Type(value = PolicyUpdatedPayload.class, name = "POLICY_UPDATED"),
         @JsonSubTypes.Type(value = UsagePersistPayload.class, name = "USAGE_PERSIST"),
-        @JsonSubTypes.Type(value = NotificationPayload.class, name = "NOTIFICATION")
+        @JsonSubTypes.Type(value = NotificationPayload.class, name = "NOTIFICATION"),
+        @JsonSubTypes.Type(value = UsageRealtimePayload.class, name = "USAGE_REALTIME")
     })
     T payload
 ) {}
@@ -807,11 +1049,46 @@ public void handleNotification(EventEnvelope<NotificationPayload> event) {
 }
 ```
 
+#### usage-realtime (실시간 대시보드 갱신 이벤트)
+
+processor-usage가 사용량 처리 후 api-core로 대시보드 갱신 데이터를 전달하는 토픽:
+
+```json
+{
+  "eventId": "rt_9f8e7d6c-...",
+  "eventType": "USAGE_REALTIME",
+  "timestamp": "2026-02-06T14:30:01Z",
+  "payload": {
+    "familyId": 100,
+    "customerId": 200,
+    "totalUsedBytes": 5242880,
+    "totalLimitBytes": 10485760,
+    "remainingBytes": 5242880,
+    "usedPercent": 50.0,
+    "monthlyUsedBytes": 1048576,
+    "userUsagePercent": 10.0,
+    "monthlyLimitBytes": 3145728
+  }
+}
+```
+
+```java
+public record UsageRealtimePayload(
+    Long familyId, Long customerId,
+    Long totalUsedBytes, Long totalLimitBytes, Long remainingBytes,
+    Double usedPercent, Long monthlyUsedBytes,
+    Double userUsagePercent, Long monthlyLimitBytes
+) {}
+```
+
+> **왜 usage-realtime 토픽을 별도로?** processor-usage가 처리한 실시간 사용량 결과를 api-core의 SSE(SseEmitter)로 즉시 Push해야 한다. usage-persist(DB 저장용)와 분리하면 대시보드 갱신은 즉시, DB 저장은 배치로 독립적으로 동작할 수 있다.
+
 ### 9.3 Consumer Group 전략
 
 | Consumer Group | 토픽 | 인스턴스 수 | 처리 방식 |
 |---------------|------|-----------|----------|
 | `processor-usage-group` | usage-events, policy-updated, usage-persist | 10 (파티션 수) | 순차 처리 + Write-Behind |
+| `api-core-group` | usage-realtime | 3 | SSE Push |
 | `notification-group` | notification-events | 2 | 병렬 처리 |
 
 ---
@@ -1154,7 +1431,8 @@ HMSET family:100:customer:4:constraints \
 
 | Key 패턴 | 타입 | 설명 | TTL |
 |----------|------|------|-----|
-| `event:dedup:{uuid}` | String | Kafka 이벤트 중복 처리 방지 | 1시간 |
+| `event:dedup:policy:{eventId}:{customerId}` | String | 정책 이벤트 중복 방지 | 1시간 |
+| `event:dedup:usage-persist:{originEventId}` | String | 사용량 DB 저장 중복 방지 | 10분 |
 | `family:{fid}:alert:{type}:{value}` | String | 알림 중복 발송 방지 | 월초 리셋 |
 
 #### 정책 메타데이터 (API용)
@@ -1163,6 +1441,16 @@ HMSET family:100:customer:4:constraints \
 |----------|------|------|
 | `policy:def:{code}` | Hash | 관리자 정의 정책 템플릿 |
 | `family:{fid}:policy:{code}` | Hash | 가족에게 적용된 정책 설정값 |
+
+#### RedisTemplate 구성
+
+| Bean | 용도 | Value Serializer |
+|------|------|-----------------|
+| `familyCacheRedisTemplate` | 가족 캐시 | Jackson2JsonRedisSerializer (FamilyCacheDto) |
+| `exampleCacheRedisTemplate` | 예제 캐시 | GenericJackson2JsonRedisSerializer |
+| `familyStringRedisTemplate` | 문자열/Lua Script | StringRedisSerializer |
+
+**캐시 전략**: Cache Look-Aside 패턴 (api-core 기본) — 캐시 확인 → 캐시 미스 시 DB 조회 → 캐시 저장 (TTL 설정)
 
 ### 12.3 MySQL ERD
 
@@ -1628,13 +1916,14 @@ db/migration/
 | GET | `/policies/{policyId}` | admin | 정책 상세 조회 |
 | PATCH | `/policies/{policyId}` | admin | 정책 수정 |
 
-### 13.5 NOTIFICATIONS 도메인 (3개)
+### 13.5 NOTIFICATIONS 도메인 (4개) — api-notification
 
 | 메서드 | 경로 | 권한 | 설명 |
 |--------|------|------|------|
-| GET | `/notifications` | member | 누적 알림 조회 |
+| GET | `/notifications` | member | 누적 알림 조회 (페이징, 읽음 필터) |
 | GET | `/notifications/alert` | member | 잔여량 경고 알림 (THRESHOLD_ALERT) |
 | GET | `/notifications/block` | member | 차단 알림 (BLOCKED, UNBLOCKED) |
+| GET | `/notifications/stream` | member | SSE 실시간 알림 스트림 |
 
 ### 13.6 ADMIN 도메인 (5개)
 
@@ -1648,7 +1937,20 @@ db/migration/
 
 ### 13.7 SSE 명세
 
-**연결**: `GET /families/{familyId}/stream` (Accept: text/event-stream)
+#### api-core SSE (실시간 사용량)
+
+- `GET /families/usage/current` — 가족 총 사용량 실시간 Push
+- `SseEmitter` 기반 (`UsageSseEmitterRegistry`)
+- Spring `ApplicationEvent` → `@EventListener` → SSE Push
+- `usage-realtime` Kafka 토픽 소비 → 실시간 대시보드 갱신
+
+#### api-notification SSE (실시간 알림)
+
+**연결**: `GET /notifications/stream` (Accept: text/event-stream)
+
+- JWT 기반 사용자 식별
+- Heartbeat: 30초 간격
+- 재연결: `Last-Event-ID` 헤더 활용
 
 **Event Types**:
 
@@ -1658,10 +1960,6 @@ db/migration/
 | CUSTOMER_BLOCKED | `{"customerId":..., "blockReason":..., "blockedAt":...}` |
 | THRESHOLD_ALERT | `{"threshold":50, "remainingPercent":48.5, "message":...}` |
 | CUSTOMER_UNBLOCKED | `{"customerId":..., "reason":..., "unblockedAt":...}` |
-| policy-updated | `{"policyKey":..., "targetCustomerId":..., "oldValue":..., "newValue":...}` |
-
-- **Heartbeat**: 30초마다 `:heartbeat` 전송
-- **재연결**: Last-Event-ID 헤더 활용
 
 > **왜 SSE? (vs WebSocket)** 서버→클라이언트 단방향 푸시만 필요(사용량 갱신, 차단 알림)하다. WebSocket의 양방향은 불필요한 복잡도를 추가한다. SSE는 HTTP/2 위에서 자동 멀티플렉싱되고, 재연결(Last-Event-ID)이 프로토콜 수준에서 지원된다.
 
@@ -1877,6 +2175,114 @@ flowchart LR
 | DDoS 방어 | AWS WAF 자동 차단 |
 | Rate Limiting | 동적 제한 (시스템 부하에 따라 조정) |
 | 감사 로그 | 모든 정책 변경 이력 기록 |
+
+### 15.5 백엔드 코드 품질 & 스타일 가이드
+
+#### 포매팅 & 린트
+
+| 항목 | 도구 | 적용 방법 |
+|------|------|----------|
+| 코드 포매팅 | Google Java Format (AOSP, 4-space indent) | `./gradlew spotlessApply` |
+| 코드 규칙 | Naver Java Convention (Checkstyle) | `./gradlew checkstyleMain` (maxWarnings=0) |
+
+**Import 순서**: `java → javax → jakarta → org → net → com → 기타 → lombok`
+
+#### 아키텍처 규칙
+
+| 대상 | 규칙 |
+|------|------|
+| Entity | Setter 금지, `@Builder`/static factory 생성, BaseEntity 상속 |
+| DTO | Response는 `static from()` + Java record, Request에 `toEntity()` 금지 |
+| Service | Interface + Impl 구조, `@Transactional`은 Service에만, 100줄 초과 시 분리 |
+| 예외 처리 | `ApplicationException` 사용, 도메인별 `ErrorCode` enum, RuntimeException 직접 throw 금지 |
+| API 응답 | 모든 응답 `ApiResponse<T>`로 통일 |
+
+> **왜 Interface + Impl 구조?** 테스트 시 Mock 교체가 용이하고, port/adapter 인프라 추상화와 일관된 패턴을 유지한다. 100줄 초과 시 분리 규칙으로 SRP를 강제한다.
+
+#### 테스트 도구
+
+| 도구 | 용도 |
+|------|------|
+| JUnit 5 + Mockito | 단위 테스트 |
+| Spring Boot Test | 통합 테스트 |
+| EmbeddedKafka | Kafka 통합 테스트 |
+| H2 | 인메모리 DB (테스트용) |
+| JaCoCo | 커버리지 리포트 (목표 70%) |
+
+### 15.6 Observability 상세
+
+#### Actuator 엔드포인트
+
+| 경로 | 설명 |
+|------|------|
+| `/actuator/health` | 헬스 체크 (liveness/readiness probe) |
+| `/actuator/prometheus` | Prometheus 메트릭 수집 |
+| `/actuator/metrics` | 시스템 메트릭 |
+| `/actuator/info` | 애플리케이션 정보 |
+| `/actuator/loggers` | 런타임 로그 레벨 변경 |
+
+#### 로깅
+
+- **Logstash Logback Encoder**: 구조화된 JSON 로그 출력
+- **로그 보안**: 외부 입력값 `sanitizeForLog()` 처리 (CR/LF/TAB 치환, 128자 제한)
+
+#### 분산 트레이싱
+
+- **Micrometer Tracing** + **OpenTelemetry Exporter**
+- OTLP 엔드포인트로 trace 데이터 전송
+- 환경변수: `OTEL_TRACING_ENABLED`, `OTEL_SAMPLING_PROBABILITY`
+
+### 15.7 환경 변수
+
+#### 공통 환경 변수
+
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `DATABASE_URL` | `jdbc:mysql://localhost:3310/app_db?...` | DB 접속 URL |
+| `DATABASE_USER` | `app_user` | DB 사용자 |
+| `DATABASE_PASSWORD` | `app_password` | DB 비밀번호 |
+| `REDIS_HOST` | `localhost` | Redis 호스트 |
+| `REDIS_PORT` | `6379` | Redis 포트 |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka 브로커 |
+| `SERVER_PORT` | `8080` | 서버 포트 |
+| `FRONTEND_URL` | `http://localhost:3000` | CORS 허용 origin |
+| `OTEL_TRACING_ENABLED` | `false` | 트레이싱 활성화 |
+
+#### 서비스별 전용 환경 변수
+
+| 변수 | 서비스 | 설명 |
+|------|--------|------|
+| `JWT_SECRET_KEY` | api-core, api-notification | JWT 서명 키 |
+| `JWT_ACCESS_TOKEN_EXPIRES_IN` | api-core, api-notification | Access Token 유효기간 (ms) |
+| `JWT_REFRESH_TOKEN_EXPIRES_IN` | api-core, api-notification | Refresh Token 유효기간 (ms) |
+| `KAFKA_CONSUMER_GROUP_ID` | 전체 (값 다름) | api-core: `dabom-api-core-dev`, processor-usage: `dabom-processor-usage-dev`, api-notification: `dabom-notification-dev` |
+| `KAFKA_POLICY_DEDUP_TTL_SECONDS` | processor-usage | 정책 이벤트 중복 방지 TTL (기본 3600초) |
+| `KAFKA_USAGE_PERSIST_DEDUP_TTL_SECONDS` | processor-usage | 사용량 DB 저장 중복 방지 TTL (기본 600초) |
+
+### 15.8 빌드 & 실행
+
+#### Gradle 태스크
+
+| 태스크 | 설명 |
+|--------|------|
+| `./gradlew bootRun` | 애플리케이션 실행 (`.env` 자동 로딩) |
+| `./gradlew bootJar` | 실행 가능한 JAR 빌드 |
+| `./gradlew test` | 단위 테스트 + JaCoCo 커버리지 |
+| `./gradlew spotlessApply` | Google Java Format 자동 포매팅 |
+| `./gradlew checkstyleMain` | Naver Java Convention 검증 |
+| `./gradlew sonar` | SonarQube 정적 분석 |
+
+#### Docker Multi-stage Build
+
+```dockerfile
+FROM eclipse-temurin:21-jdk AS builder
+# ...빌드 단계 (bootJar)...
+FROM eclipse-temurin:21-jre
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+> **왜 Multi-stage Build?** 빌드 도구(JDK, Gradle)를 최종 이미지에서 제외하여 이미지 크기를 최소화한다. eclipse-temurin:21-jdk(~400MB) → eclipse-temurin:21-jre(~200MB)로 절반 이상 감소.
 
 ---
 
