@@ -109,7 +109,7 @@ flowchart TB
     end
 
     subgraph EVENT["Event Backbone"]
-        KF[["Kafka (MSK)<br/>usage-events | policy-updated | notification-events"]]
+        KF[["Kafka (MSK)<br/>usage-events | notification-events"]]
         class KF event
     end
 
@@ -135,9 +135,8 @@ flowchart TB
 
     AC -->|CRUD| DB
     AC -->|캐시| RD
-    AC -->|policy-updated| KF
 
-    KF -->|usage-events<br/>policy-updated| UP
+    KF -->|usage-events| UP
 
     UP -->|Lua 원자 연산| RD
     UP -->|직접 DB 정산| DB
