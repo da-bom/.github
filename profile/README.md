@@ -158,7 +158,7 @@ flowchart TB
 | **Simulation** | simulator-usage | Go 기반 트래픽 시뮬레이터, 4종 부하 패턴, HTTP 제어 API |
 | **API** | api-core | 9개 도메인 REST API, JWT 인증, 정책 변경 트리거 |
 | **API** | api-notification | notification-events 소비, SSE 1초 폴링 + Web Push (VAPID) |
-| **Event Backbone** | Kafka (MSK) | 3개 토픽, familyId 파티셔닝으로 가족 단위 순서 보장 |
+| **Event Backbone** | Kafka (MSK) | 2개 토픽, familyId 파티셔닝으로 가족 단위 순서 보장 |
 | **Processing** | processor-usage | 정책 평가·쿼터 차감(Redis Lua), 직접 DB 정산, Outbox 적재 |
 | **Batch** | batch-core | 월경계 전환, DB-Redis 정합성 복구, 주간/월간 리캡 집계, Outbox 후행 발행 |
 | **Data** | Redis + MySQL | Redis(실시간 상태/원자 연산) + MySQL(영속 데이터/감사 로그) |
@@ -256,7 +256,6 @@ Owner UI → api-core → RDS 저장 (Source of Truth)
                      → Redis constraints 즉시 갱신
                      → CustomerQuota 한도/차단 상태 반영
                      → Outbox 알림 적재
-                     → Kafka policy-updated 발행
                                 ↓
                      processor-usage → 현재 사용량 vs 신규 한도 → 초과 시 즉시 차단
 ```
